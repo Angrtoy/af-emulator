@@ -511,6 +511,9 @@ def main():
     loader_proc = None
     loader_log_handle = None
     spawn_started = None
+    loader_attempt = 0
+    loader_request = None
+    max_loader_restarts = 3
     afdev_ready = not args.lazy_spawn
     max_peers = max(1, int(args.max_players))
 
@@ -578,8 +581,11 @@ def main():
 
     def spawn_loader(addr, packet_id, records_count):
         nonlocal loader_proc, loader_log_handle, spawn_started, trigger_client
+        nonlocal loader_attempt, loader_request
         if not args.lazy_spawn or loader_proc is not None:
             return
+        loader_attempt += 1
+        loader_request = (addr, packet_id, records_count)
         loader_script = Path(args.loader_script).resolve()
         if not loader_script.is_file():
             raise RuntimeError(f"missing loader: {loader_script}")
@@ -601,6 +607,13 @@ def main():
         child_env.setdefault("PYTHONUTF8", "1")
         child_env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if loader_log_handle is not None:
+            try:
+                loader_log_handle.flush()
+                loader_log_handle.close()
+            except Exception:
+                pass
+            loader_log_handle = None
         if DS_DIAGNOSTICS:
             stdout_target = subprocess.PIPE
         elif loader_log:
@@ -648,14 +661,97 @@ def main():
             spawned_at=spawn_started,
             trigger_packet_id=packet_id,
             trigger_record_count=records_count,
+            loader_attempt=loader_attempt,
+            loader_restarts=loader_attempt - 1,
+            afdev_pid=0,
         )
         print(
-            f"[BRIDGE-v9] FIRST VALID DS UDP from {addr[0]}:{addr[1]} PacketId={packet_id} "
-            f"records={records_count} -> spawning v48 loader pid={loader_proc.pid} target_udp={target[1]} "
+            f"[BRIDGE-v9] {'FIRST ' if loader_attempt == 1 else 'RETRY '}VALID DS UDP from {addr[0]}:{addr[1]} PacketId={packet_id} "
+            f"records={records_count} -> spawning v48 loader attempt={loader_attempt}/{max_loader_restarts + 1} pid={loader_proc.pid} target_udp={target[1]} "
             f"mode=0x{int(args.mode_id):08x} map=0x{int(args.map_id):04x} "
             f"submode=0x{int(args.sub_mode_id):08x} flags=0x{int(args.room_flags):08x}",
             flush=True,
         )
+
+    def stop_failed_afdev():
+        afdev_pid = None
+        if pid_file and pid_file.exists():
+            try:
+                afdev_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                afdev_pid = None
+
+        if afdev_pid and afdev_pid not in (os.getpid(), getattr(loader_proc, "pid", None)):
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(afdev_pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    timeout=10.0,
+                )
+            else:
+                try:
+                    os.kill(afdev_pid, 15)
+                except OSError:
+                    pass
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.bind(target)
+                return afdev_pid
+            except OSError:
+                time.sleep(0.10)
+            finally:
+                probe.close()
+        raise RuntimeError(
+            f"AFDEV target UDP {target[0]}:{target[1]} stayed busy after cleanup"
+        )
+
+    def restart_failed_loader(detail, stop_running_loader=False):
+        nonlocal loader_proc, loader_log_handle
+        if (
+            loader_proc is None
+            or (loader_proc.poll() is None and not stop_running_loader)
+            or loader_attempt - 1 >= max_loader_restarts
+            or loader_request is None
+        ):
+            return False
+
+        failed_attempt = loader_attempt
+        try:
+            if stop_running_loader and loader_proc.poll() is None:
+                loader_proc.terminate()
+                try:
+                    loader_proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    loader_proc.kill()
+                    loader_proc.wait(timeout=2.0)
+            afdev_pid = stop_failed_afdev()
+            if loader_log_handle is not None:
+                loader_log_handle.flush()
+                loader_log_handle.close()
+                loader_log_handle = None
+            loader_proc = None
+            print(
+                f"[BRIDGE-v9] loader attempt={failed_attempt}/{max_loader_restarts + 1} failed; "
+                f"stopped AFDEV pid={afdev_pid or 0}; restarting "
+                f"({failed_attempt}/{max_loader_restarts} retries used) detail={detail[-1200:]}",
+                flush=True,
+            )
+            publish(state="RESTARTING", afdev_pid=0, loader_restarts=failed_attempt)
+            time.sleep(0.25)
+            spawn_loader(*loader_request)
+            return True
+        except Exception as restart_exc:
+            failed = (
+                f"{detail}; AFDEV restart {failed_attempt}/{max_loader_restarts} "
+                f"failed: {type(restart_exc).__name__}: {restart_exc}"
+            )
+            publish(state="FAILED", error=failed)
+            raise RuntimeError(failed) from restart_exc
 
     def send_peer_latched(addr, pstate, reason):
         wire = pstate.get("latched_wire")
@@ -703,10 +799,14 @@ def main():
                         detail += "; loader_log_tail=" + tail[-3500:]
             except Exception:
                 pass
+            if restart_failed_loader(detail):
+                return
             publish(state="FAILED", error=detail)
             raise RuntimeError(detail)
         if spawn_started is not None and time.time() - spawn_started > max(5.0, float(args.startup_timeout)):
             detail = f"SESSION_READY timeout after {args.startup_timeout:.1f}s"
+            if restart_failed_loader(detail, stop_running_loader=True):
+                return
             publish(state="FAILED", error=detail)
             raise RuntimeError(detail)
         if pid_file and pid_file.exists():

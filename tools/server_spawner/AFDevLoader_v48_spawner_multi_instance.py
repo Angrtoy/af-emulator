@@ -5323,6 +5323,22 @@ def _pve_construct_fname(hproc, hthread, text_value):
     prev = kernel32.SuspendThread(hthread)
     if prev == 0xFFFFFFFF:
         winerr("SuspendThread(PvE FName)")
+    if prev != 0:
+        # SuspendThread returns the count that was already present.  If the
+        # game thread was suspended by another loader operation, one matching
+        # ResumeThread only removes our own increment; the thread stays parked
+        # and the injected FName call can never set done_ptr.  Leave its context
+        # untouched and let the bounded PvE-settings retry wait for it to run.
+        resumed = kernel32.ResumeThread(hthread)
+        if resumed == 0xFFFFFFFF:
+            winerr("ResumeThread(PvE FName defer)")
+        kernel32.VirtualFreeEx(
+            hproc, ctypes.c_void_p(remote), 0, MEM_RELEASE
+        )
+        raise RuntimeError(
+            f"FName({text_value!r}) deferred: game thread already suspended "
+            f"(previous_suspend_count={prev})"
+        )
     suspended = True
     try:
         ctx = WOW64_CONTEXT()
@@ -6631,6 +6647,10 @@ def main():
                             permanent = (
                                 "unsupported AFDEV ModeId" in msg
                                 or "unsupported PvE SubModeId" in msg
+                                # A failed injected FName call may still be
+                                # executing. Restart the whole AFDEV process
+                                # instead of retrying injection into it.
+                                or "FName(" in msg
                             )
                             if permanent or not process_alive(pi.hProcess):
                                 raise

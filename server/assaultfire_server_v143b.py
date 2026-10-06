@@ -9,6 +9,8 @@
 import re
 from pathlib import Path
 import socket
+import copy
+import functools
 import threading
 import time
 import struct
@@ -674,6 +676,49 @@ def _v178_parse_trace_enter(body, role_state):
                 tail=b'', invite_id=invite_id, inviter=friend)
 
 
+def _v178_reject_pending_invite(actor, nickname, invite_id=None, body=None):
+    """Discard a failed room invite and tell its sender the room was unusable."""
+    actor = int(actor)
+    pending = []
+    with _V150_ZONE_LOCK:
+        if invite_id is not None:
+            entry = _V177_ROOM_INVITES.get(int(invite_id))
+            if entry and int(entry.get('recipient', 0)) == actor:
+                pending.append(_V177_ROOM_INVITES.pop(int(invite_id)))
+        elif body is not None:
+            try:
+                raw = bytes(body)
+                if len(raw) < 18:
+                    raise ValueError('short A120')
+                room_id = struct.unpack_from('>Q', raw)[0]
+                _, _, off = _v79_read_lp_string(raw, 8, 8)
+                if off + 10 != len(raw):
+                    raise ValueError('invalid A120 tail')
+                kind, inviter = struct.unpack_from('>HQ', raw, off)
+            except Exception:
+                kind, inviter, room_id = 0, 0, 0
+            if kind == 2:
+                for rid, entry in list(_V177_ROOM_INVITES.items()):
+                    if (int(entry.get('sender', 0)) == int(inviter)
+                            and int(entry.get('recipient', 0)) == actor
+                            and int(entry.get('room', 0)) == int(room_id)):
+                        pending.append(_V177_ROOM_INVITES.pop(rid))
+
+    for entry in pending:
+        failure = _v62_build_server_app(
+            TGAME_ZN_MAGIC,
+            0xA316,
+            _v50_geo_tdr_string(str(nickname or ''), 32)
+            + _v48_u16(0x030F)
+            + _v48_i32(0),
+        )
+        _v150_send_online(
+            int(entry['sender']),
+            failure,
+            f'friend room invite failed id={invite_id or 0} recipient={actor}',
+        )
+
+
 def _v177_friend_action(conn, key, label, role_state, app):
     global _V177_INVITE_SEQUENCE
     cmd, body = app['cmd'], bytes(app['body'])
@@ -1164,6 +1209,9 @@ def recv_ap_frame(conn, timeout=15.0):
         body_len,
         timeout=timeout
     )
+
+    if body_len == 0:
+        raise ValueError("empty AP body")
 
     if len(ciphertext) != body_len:
         raise ValueError(
@@ -4739,12 +4787,41 @@ class _V140PlayerStateManager:
         self._tls = threading.local()
         self._lock = threading.RLock()
         self._cache = {}
+        self._uin_locks = {}
+        self._warned_default_uin = set()
         self._last_active_uin = None
+
+    def uin_lock(self, uin=None):
+        """Per-UIN re-entrant lock: serialises check-then-spend sequences."""
+        uin = self.current_uin() if uin is None else int(uin)
+        with self._lock:
+            lock = self._uin_locks.get(uin)
+            if lock is None:
+                lock = self._uin_locks[uin] = threading.RLock()
+            return lock
 
     def current_uin(self):
         # Runtime packet threads explicitly select their authenticated UIN.
         # 10001 is a compatibility fallback for legacy helper/self-test code.
-        return int(getattr(self._tls, "uin", 10001))
+        uin = getattr(self._tls, "uin", None)
+        if uin is None:
+            # A thread that never called select() would silently read/write
+            # player 10001's state. Fail loudly when AF_STRICT_UIN=1, and
+            # otherwise warn once per thread so the leak is visible.
+            if os.environ.get("AF_STRICT_UIN") == "1":
+                raise RuntimeError(
+                    "no player UIN selected on this thread (AF_STRICT_UIN=1)"
+                )
+            name = threading.current_thread().name
+            if name not in self._warned_default_uin:
+                self._warned_default_uin.add(name)
+                print(
+                    f"[MALL-SQLITE] WARNING: thread {name!r} has no selected "
+                    "UIN; falling back to 10001",
+                    flush=True,
+                )
+            return 10001
+        return int(uin)
 
     def select(self, uin):
         uin = int(uin)
@@ -4854,6 +4931,33 @@ class _V140InventoryProxy(MutableSequence):
 _V140_PLAYER_STATE = _V140PlayerStateManager(PLAYER_DB)
 V140_MALL_STATE = _V140StateProxy(_V140_PLAYER_STATE)
 V111_INVENTORY = _V140InventoryProxy(_V140_PLAYER_STATE)
+
+
+def _v140_uin_atomic(fn=None, *, rollback=False):
+    """Run a player-state mutator under the per-UIN lock.
+
+    ROLE and ZONE connections (and reconnects) for the same UIN run on
+    different threads and share one in-memory state dict; unlocked
+    read-modify-write sequences such as ``V111_INVENTORY[:] = [...]`` can lose
+    a concurrent purchase. With rollback=True the state is restored if the
+    function raises (e.g. the SQLite save fails) so cache and DB stay equal.
+    """
+    def wrap(f):
+        @functools.wraps(f)
+        def inner(*args, **kwargs):
+            with _V140_PLAYER_STATE.uin_lock():
+                if not rollback:
+                    return f(*args, **kwargs)
+                state = _V140_PLAYER_STATE.state()
+                snapshot = copy.deepcopy(state)
+                try:
+                    return f(*args, **kwargs)
+                except BaseException:
+                    state.clear()
+                    state.update(snapshot)
+                    raise
+        return inner
+    return wrap(fn) if fn is not None else wrap
 
 
 def _v140_current_role_gid():
@@ -5042,16 +5146,95 @@ def _v173_character_accessory_slot(item_id):
     return V173_CHARACTER_ACCESSORY_SLOTS.get(int(item_id))
 
 
+def _v173_character_bundle_component_roles():
+    """Map bundled character appearance parts to the role roots they belong to."""
+    component_roles = {}
+    for bundle in V140_COMMODITY_BUNDLES.values():
+        items = tuple(int(item_id) for item_id in bundle)
+        if sum(300000 <= item_id < 400000 for item_id in items) < 2:
+            continue
+        role_item_id = None
+        for item_id in items:
+            if _v140_role_slot(item_id) is not None:
+                role_item_id = item_id
+                continue
+            if (role_item_id is not None
+                    and _v173_character_accessory_slot(item_id) is not None):
+                component_roles.setdefault(item_id, set()).add(role_item_id)
+    return {
+        item_id: frozenset(role_item_ids)
+        for item_id, role_item_ids in component_roles.items()
+    }
+
+
+V173_CHARACTER_BUNDLE_COMPONENT_ROLE_ITEMS = (
+    _v173_character_bundle_component_roles()
+)
+
+
+def _v173_is_character_bundle_component(prop):
+    item_id = int(prop.get("item_id", 0))
+    return (
+        item_id in V173_CHARACTER_BUNDLE_COMPONENT_ROLE_ITEMS
+        and int(prop.get("durability_max", prop.get("durability", 0))) == 0
+    )
+
+
 def _v173_repair_accessory_owners():
-    """Return accessories incorrectly mounted on backpacks/root to storage."""
+    """Restore bundled character parts and return misplaced accessories to storage."""
     invalid_owners = _v141_bag_gids() | {V110_BAG_MOUNT_OWNER}
+    by_gid = {int(prop["gid"]): prop for prop in V111_INVENTORY}
     changes = []
     for prop in V111_INVENTORY:
-        if (_v173_character_accessory_slot(prop.get("item_id", 0)) is not None
-                and int(prop.get("owner_gid", 0)) in invalid_owners):
-            before = (int(prop["owner_gid"]), int(prop["location"]))
+        item_id = int(prop.get("item_id", 0))
+        owner_gid = int(prop.get("owner_gid", 0))
+        role_item_ids = V173_CHARACTER_BUNDLE_COMPONENT_ROLE_ITEMS.get(item_id)
+        if role_item_ids and _v173_is_character_bundle_component(prop):
+            current_owner = by_gid.get(owner_gid)
+            if (
+                current_owner is not None
+                and int(current_owner.get("item_id", 0)) in role_item_ids
+                and _v140_role_slot(int(current_owner.get("item_id", 0))) is not None
+            ):
+                continue
+
+            role_roots = [
+                candidate for candidate in V111_INVENTORY
+                if int(candidate.get("item_id", 0)) in role_item_ids
+                and _v140_role_slot(int(candidate.get("item_id", 0))) is not None
+            ]
+            if role_roots:
+                selected_role_gid = int(_v140_current_role_gid())
+                target = next(
+                    (candidate for candidate in role_roots
+                     if int(candidate["gid"]) == owner_gid),
+                    None,
+                ) or next(
+                    (candidate for candidate in role_roots
+                     if int(candidate["gid"]) == selected_role_gid),
+                    role_roots[0],
+                )
+                default_loc = int(V140_ITEM_DEFAULT_LOCATIONS.get(item_id, -1))
+                location = 0xFF if default_loc < 0 else default_loc
+                before = (owner_gid, int(prop["location"]))
+                prop["owner_gid"], prop["location"] = int(target["gid"]), location
+                changes.append((
+                    int(prop["gid"]), item_id, before,
+                    (int(target["gid"]), location),
+                ))
+            elif owner_gid in invalid_owners:
+                before = (owner_gid, int(prop["location"]))
+                prop["owner_gid"], prop["location"] = 0, V109_LOC_BAG
+                changes.append((
+                    int(prop["gid"]), item_id, before, (0, V109_LOC_BAG),
+                ))
+            continue
+
+        if (_v173_character_accessory_slot(item_id) is not None
+                and owner_gid in invalid_owners):
+            before = (owner_gid, int(prop["location"]))
             prop["owner_gid"], prop["location"] = 0, V109_LOC_BAG
-            changes.append((int(prop["gid"]), int(prop["item_id"]), before))
+            changes.append((int(prop["gid"]), item_id, before, (0, V109_LOC_BAG)))
     return changes
 
 
@@ -5078,11 +5261,16 @@ def _v173_apply_accessory_equip(op):
                          location=int(subject.get("location", V109_LOC_BAG)))
         return "v173 accessory equip ignored: no owned character root", effective
 
-    # Exclusivity is within this character, never across bag weapon sockets.
+    # Accessories share sockets with bundled role appearance parts. Keep
+    # those parts mounted; only standalone accessories replace one another.
     for other in V111_INVENTORY:
-        if (other is not subject and int(other.get("owner_gid", 0)) == owner
-                and int(other.get("location", V109_LOC_BAG)) == slot):
-            other["owner_gid"], other["location"] = 0, V109_LOC_BAG
+        if (other is subject or int(other.get("owner_gid", 0)) != owner
+                or int(other.get("location", V109_LOC_BAG)) != slot):
+            continue
+        if (_v173_is_character_bundle_component(subject)
+                or _v173_is_character_bundle_component(other)):
+            continue
+        other["owner_gid"], other["location"] = 0, V109_LOC_BAG
     subject["owner_gid"], subject["location"] = owner, slot
     effective.update(target_gid=owner, location=slot)
     return (f"v173 accessory equip item={item_id} character=0x{owner:016x} "
@@ -5239,6 +5427,7 @@ def _v140_prop_is_expired(prop, now=None):
     return expires_at > 0 and expires_at <= now
 
 
+@_v140_uin_atomic
 def _v140_expire_due_items(now=None, reason="item-expiration"):
     """Expire Mall props without deleting equipment stored inside backpacks."""
     now = int(time.time() if now is None else now)
@@ -5339,6 +5528,7 @@ def _v140_expire_due_items(now=None, reason="item-expiration"):
     return removed_props
 
 
+@_v140_uin_atomic
 def _v170_reconcile_progression_skills():
     """Synchronize normal PVE skill ownership to persisted Experience.
 
@@ -5492,7 +5682,7 @@ def _v140_select_player(uin):
     accessory_repairs = _v173_repair_accessory_owners()
     if accessory_repairs:
         _v140_save_state("character-accessory-owner-repair-v173")
-        log("MALL", f"v173 returned misplaced accessories to storage uin={uin} changes={accessory_repairs}")
+        log("MALL", f"v173 repaired character/accessory ownership uin={uin} changes={accessory_repairs}")
 
     return _V140_PLAYER_STATE.state()
 
@@ -6062,6 +6252,57 @@ def _v140_plan_purchase(req, self_uin=V109_UIN):
     }
 
 
+def _v140_commit_purchase(req, self_uin=V109_UIN):
+    """Plan, apply and persist a purchase under the per-UIN lock.
+
+    The balance check and the spend happen in one critical section (no
+    double-spend across sessions), and the in-memory state is rolled back if
+    the SQLite save fails so the cache never diverges from the database.
+    Returns (plan, moneyflow_rows). Raises _v140_ShopReject on any failure.
+    """
+    with _V140_PLAYER_STATE.uin_lock():
+        plan = _v140_plan_purchase(req, self_uin=self_uin)
+
+        state = _V140_PLAYER_STATE.state()
+        snapshot = copy.deepcopy(state)
+        try:
+            all_new_props = []
+            for row in plan["staged"]:
+                all_new_props.extend(row["props"])
+            V111_INVENTORY.extend(dict(p) for p in all_new_props)
+
+            wallet = _v140_wallet()
+            wallet["ap"] -= int(plan["consume_tp"])
+            wallet["gp"] -= int(plan["consume_gp"])
+            wallet["mp"] -= int(plan["consume_mp"])
+
+            purchase_time = int(time.time())
+            details = "; ".join(
+                str(r.get("commodity_name", ""))
+                for r in plan["staged"]
+                if str(r.get("commodity_name", ""))
+            )
+            moneyflow_rows = _v140_make_purchase_moneyflow_rows(
+                session_uin=self_uin,
+                consume_tp=plan["consume_tp"],
+                consume_gp=plan["consume_gp"],
+                consume_mp=plan["consume_mp"],
+                occurred_at=purchase_time,
+                details=details,
+                commodity_ids=[int(r["commodity_id"]) for r in plan["staged"]],
+            )
+            _v140_save_state("buy", moneyflow_rows=moneyflow_rows)
+        except Exception as e:
+            state.clear()
+            state.update(snapshot)
+            log("MALL", f"purchase rolled back after error: {e!r}")
+            raise _v140_ShopReject(
+                SHOP_ERR_FAIL, f"purchase commit failed: {e!r}"
+            ) from e
+
+        return plan, moneyflow_rows
+
+
 def _v140_build_buy_response(
     req,
     staged,
@@ -6478,6 +6719,7 @@ def _v160_find_inventory_item(item_id):
     return min(candidates, key=_sort_key)
 
 
+@_v140_uin_atomic(rollback=True)
 def _v160_consume_inventory_item(item_id, reason):
     prop = _v160_find_inventory_item(item_id)
     if prop is None:
@@ -6677,6 +6919,7 @@ def _v143b_resolve_null_subject_unequip(op):
     return None
 
 
+@_v140_uin_atomic(rollback=True)
 def _v111_apply_prop_operation(op):
     """Apply one live A008 operation to the v110 starter inventory.
 
@@ -9857,6 +10100,12 @@ def handle_placeholder(conn, addr, label):
                 except socket.timeout:
                     continue
 
+                if rx_chunk and label.upper() in ("ZONE", "DS-TCP"):
+                    # Treat the lifetime as an IDLE timeout for long-lived
+                    # sessions: activity extends it instead of cutting an
+                    # active player off at a fixed wall-clock hour.
+                    deadline = time.time() + followup_seconds
+
                 if not rx_chunk:
                     log(label, "Client closed connection; if this was client.exe after TACC-RSP, that can be normal. Watch for next VERSION/ROLE owner=TGame.exe.")
                     break
@@ -10696,9 +10945,13 @@ def handle_placeholder(conn, addr, label):
                                             )
 
                                             try:
-                                                plan = _v140_plan_purchase(
-                                                    req,
-                                                    self_uin=_v150_role_uin(role_state),
+                                                plan, purchase_moneyflow_rows = (
+                                                    _v140_commit_purchase(
+                                                        req,
+                                                        self_uin=_v150_role_uin(
+                                                            role_state
+                                                        ),
+                                                    )
                                                 )
                                             except _v140_ShopReject as reject:
                                                 log(
@@ -10726,46 +10979,8 @@ def handle_placeholder(conn, addr, label):
                                                 for row in plan["staged"]:
                                                     all_new_props.extend(row["props"])
 
-                                                # Atomic commit point.
-                                                V111_INVENTORY.extend(
-                                                    dict(p) for p in all_new_props
-                                                )
+                                                # Commit already applied atomically by _v140_commit_purchase.
                                                 wallet = _v140_wallet()
-                                                wallet["ap"] -= int(plan["consume_tp"])
-                                                wallet["gp"] -= int(plan["consume_gp"])
-                                                wallet["mp"] -= int(plan["consume_mp"])
-
-                                                purchase_uin = _v150_role_uin(
-                                                    role_state
-                                                )
-                                                purchase_time = int(time.time())
-                                                purchase_details = "; ".join(
-                                                    str(row.get("commodity_name", ""))
-                                                    for row in plan["staged"]
-                                                    if str(row.get("commodity_name", ""))
-                                                )
-                                                purchase_commodity_ids = [
-                                                    int(row["commodity_id"])
-                                                    for row in plan["staged"]
-                                                ]
-                                                purchase_moneyflow_rows = (
-                                                    _v140_make_purchase_moneyflow_rows(
-                                                        session_uin=purchase_uin,
-                                                        consume_tp=plan["consume_tp"],
-                                                        consume_gp=plan["consume_gp"],
-                                                        consume_mp=plan["consume_mp"],
-                                                        occurred_at=purchase_time,
-                                                        details=purchase_details,
-                                                        commodity_ids=purchase_commodity_ids,
-                                                    )
-                                                )
-
-                                                # Wallet, inventory and Consumer List rows
-                                                # become durable in one SQLite transaction.
-                                                _v140_save_state(
-                                                    "buy",
-                                                    moneyflow_rows=purchase_moneyflow_rows,
-                                                )
 
                                                 rsp = _v140_build_buy_response(
                                                     req,
@@ -12232,9 +12447,18 @@ def handle_placeholder(conn, addr, label):
                                             )
 
                                         elif app["cmd"] in (TGAME_ZN_REQ_ENTERMATCHROOM, 0xA120):
-                                            er = (_v178_parse_trace_enter(app["body"], role_state) if app["cmd"] == 0xA120 else _v150_parse_enter_match_room(app["body"]))
                                             uin_now = _v150_role_uin(role_state)
                                             nickname_now = _v150_role_nickname(role_state)
+                                            try:
+                                                er = (_v178_parse_trace_enter(app["body"], role_state)
+                                                      if app["cmd"] == 0xA120
+                                                      else _v150_parse_enter_match_room(app["body"]))
+                                            except Exception:
+                                                if app["cmd"] == 0xA120:
+                                                    _v178_reject_pending_invite(
+                                                        uin_now, nickname_now, body=app["body"]
+                                                    )
+                                                raise
                                             prior_room = V150_ROOM_REGISTRY.room_for_player(uin_now)
                                             joined_new_member = prior_room is None
                                             try:
@@ -12245,7 +12469,7 @@ def handle_placeholder(conn, addr, label):
                                                     password=er["password"],
                                                     observer=er["observer"],
                                                 )
-                                                if (V143B_DS_CONFIG.enabled and not (app["cmd"] == 0xA120 and er.get("invite_id") is not None)):
+                                                if V143B_DS_CONFIG.enabled:
                                                     V143B_DS_SPAWNER.register_room_player(
                                                         int(joined_room["room_id"]),
                                                         uin_now,
@@ -12268,6 +12492,12 @@ def handle_placeholder(conn, addr, label):
                                                             f"r11 A104 rollback failed uin={uin_now} "
                                                             f"room={er['room_id']}: {rollback_e}",
                                                         )
+                                                if app["cmd"] == 0xA120 and er.get("invite_id") is not None:
+                                                    _v178_reject_pending_invite(
+                                                        uin_now,
+                                                        nickname_now,
+                                                        invite_id=er.get("invite_id"),
+                                                    )
                                                 log(
                                                     "ROOM",
                                                     f"r11 A104 join rejected uin={uin_now} "
@@ -13930,6 +14160,8 @@ def handle_placeholder(conn, addr, label):
                                                     social_uin,
                                                     accepted,
                                                 )
+                                                requested_accept = accepted
+                                                accepted = str(request_row.get("status")) == "accepted"
                                                 proposer_uin = int(request_row["from_uin"])
 
                                                 if accepted:
@@ -13968,7 +14200,9 @@ def handle_placeholder(conn, addr, label):
                                                     "SOCIAL",
                                                     "A307 friend request resolved "
                                                     f"id={int(rsp['request_id'])} acceptor={social_uin} "
-                                                    f"accepted={accepted} result=0x{int(rsp['result']):04x}",
+                                                    f"accepted={accepted} requested_accept={requested_accept} "
+                                                    f"duplicate={bool(request_row.get('duplicate'))} "
+                                                    f"result=0x{int(rsp['result']):04x}",
                                                 )
                                             except Exception as social_e:
                                                 log(
@@ -15522,7 +15756,7 @@ def _bind_tcp_listener(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("0.0.0.0", int(port)))
-    s.listen(10)
+    s.listen(128)
     return s
 
 
@@ -15563,8 +15797,19 @@ def _prepare_listener_sockets():
         raise
 
 
+_MAX_CONNS_PER_PORT = max(8, int(os.environ.get("AF_MAX_CONNS_PER_PORT", "512")))
+
+
+def _run_connection(target, args, slots):
+    try:
+        target(*args)
+    finally:
+        slots.release()
+
+
 def listen_on_port(port, label, sock=None):
     s = sock if sock is not None else _bind_tcp_listener(port)
+    slots = threading.BoundedSemaphore(_MAX_CONNS_PER_PORT)
 
     log(
         label,
@@ -15572,6 +15817,7 @@ def listen_on_port(port, label, sock=None):
     )
 
     while True:
+        conn = None
         try:
             conn, addr = s.accept()
 
@@ -15591,17 +15837,42 @@ def listen_on_port(port, label, sock=None):
                 target = handle_placeholder
                 args = (conn, addr, label)
 
-            threading.Thread(
-                target=target,
-                args=args,
-                daemon=True
-            ).start()
+            # Cap concurrent handler threads per port so a connection flood
+            # (or many idle sockets) cannot exhaust threads/memory.
+            if not slots.acquire(blocking=False):
+                log(label, f"connection limit {_MAX_CONNS_PER_PORT} reached; "
+                           f"dropping {addr}")
+                conn.close()
+                continue
+
+            try:
+                threading.Thread(
+                    target=_run_connection,
+                    args=(target, args, slots),
+                    daemon=True
+                ).start()
+            except Exception:
+                slots.release()
+                raise
 
         except Exception as e:
+            # Never leak the accepted socket if the handler thread could not
+            # be started.
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             log(
                 label,
                 f"accept error: {e}"
             )
+            if s.fileno() == -1:
+                log(label, "listener socket closed; stopping accept loop")
+                return
+            # Persistent accept() failures (e.g. EMFILE) used to spin at
+            # 100% CPU and flood the log; back off briefly.
+            time.sleep(0.2)
 
 
 # ---------------------------------------------------------------------------

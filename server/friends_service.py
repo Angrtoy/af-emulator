@@ -766,8 +766,9 @@ class FriendsService:
                     f"friend request {request_id} is not addressed to uin={to_uin}"
                 )
             duplicate = str(row["status"]) != "pending"
+            resolved_status = str(row["status"])
             if not duplicate:
-                status = "accepted" if accepted else "rejected"
+                resolved_status = "accepted" if accepted else "rejected"
                 now = _utc_now()
                 conn.execute(
                     "UPDATE friend_requests SET status=?, resolved_at=? WHERE request_id=?",
@@ -786,7 +787,7 @@ class FriendsService:
                     )
             conn.commit()
             out = dict(row)
-            out["status"] = "accepted" if accepted else "rejected"
+            out["status"] = resolved_status
             out["duplicate"] = duplicate
             return out
         except Exception:

@@ -21,7 +21,7 @@ Tan-awa ang [kompletong English guide](README.md) para sa tanang lakang ug eksak
 
 ## Status ug paghangyo og tabang
 
-Ang public stable baseline karon kay **v143b**. Nagtrabaho ang VERSION, AUTH, DIR, ROLE ug ZONE, room management, ug PvE match flow. Nagpadayon pa ang pag-ayo sa first-time nickname/account creation ug pipila ka social/progression features. Temporaryo pa usab ang local AP initialization sync sa client.
+Ang public stable baseline karon kay **v143b**. Nagtrabaho ang VERSION, AUTH, DIR, ROLE ug ZONE, room management, ug PvE match flow. Nagpadayon pa ang pag-ayo sa first-time nickname/account creation ug pipila ka social/progression features. Ang AP synchronization naggamit na sa native protocol path; wala nay local process-memory AP helper.
 
 Kon mangayo kag tabang, ipadala ang screenshot sa error, unsang lakang ka, eksaktong command, `server/af_server_live.log`, ug game version. **Ayaw ipadala** ang `PRIVATE.PEM`, password, account credentials, token, o orihinal nga game files.
 

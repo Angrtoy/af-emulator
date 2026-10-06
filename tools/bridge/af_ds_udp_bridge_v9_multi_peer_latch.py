@@ -8,6 +8,21 @@ import struct
 import select
 import time
 from pathlib import Path
+from collections import deque
+
+DS_DIAGNOSTICS = None
+LOADER_DIAGNOSTIC_TAIL = deque(maxlen=14)
+LOADER_DIAGNOSTIC_THREAD = None
+if os.environ.get("AF_DS_DIAGNOSTICS_DB"):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "server"))
+    from assaultfire_ds_diagnostics import from_environment, capture_pipe
+    DS_DIAGNOSTICS = from_environment()
+
+
+def diagnostic_context():
+    return (os.environ.get("AF_DS_DIAGNOSTICS_SESSION"),
+            int(os.environ.get("AF_DS_DIAGNOSTICS_ROOM", "0")),
+            int(os.environ.get("AF_DS_DIAGNOSTICS_UIN", "0")))
 
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -17,14 +32,14 @@ LISTEN_PORT = 65008
 TARGET = ("127.0.0.1", 7777)
 
 # The current AFDEV listen server selected the dynamic all-zero 128-bit DS key.
-# This key is used ONLY to decode a diagnostic copy.  Packets are relayed
-# byte-for-byte unchanged.
+# The key also decodes per-UIN Login Name updates.
+# Other packets are forwarded unchanged.
 DECODE_KEY = b"\x00" * 16
 
 SIO_UDP_CONNRESET = 0x9800000C
 
-# v5 diagnostic actor-channel capture.  The relay itself remains transparent:
-# datagrams are still forwarded byte-for-byte unchanged.
+# v5 diagnostic actor-channel capture. Login Name is rewritten per UIN;
+# other datagrams are forwarded unchanged.
 ACTOR_DUMP_PATH = Path(__file__).with_name("af_actor_payloads.log")
 ACTOR_SEEN = {}
 CH2_DUMP_LIMIT = 12
@@ -32,6 +47,9 @@ OTHER_CHANNEL_EARLY_DUMP_LIMIT = 2
 
 
 def append_actor_dump(line):
+    if DS_DIAGNOSTICS:
+        DS_DIAGNOSTICS.append(*diagnostic_context(), "actor", line)
+        return
     try:
         with ACTOR_DUMP_PATH.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -350,6 +368,10 @@ def valid_ds_client_packet(wire):
 
 
 def main():
+    from af_login_names import LoginNameRewriter
+    nickname_rewriter = LoginNameRewriter(Path(__file__).resolve().parents[2])
+    os.environ["AF_DYNAMIC_LOGIN_NAMES"] = "1"
+    print(f"[LOGIN-PATCH] Dynamic per-UIN nicknames enabled DB={nickname_rewriter.db_path}", flush=True)
     global ACTOR_DUMP_PATH
     ap = argparse.ArgumentParser(description="Assault Fire PH per-instance UDP bridge v9 multi-peer first-packet-latch AFDEV spawn")
     ap.add_argument("--listen-ip", default=LISTEN_IP)
@@ -357,6 +379,13 @@ def main():
     ap.add_argument("--target-host", default=TARGET[0])
     ap.add_argument("--target-port", type=int, default=TARGET[1])
     ap.add_argument("--actor-dump", default=str(ACTOR_DUMP_PATH))
+    ap.add_argument(
+        "--packet-diagnostics",
+        action="store_true",
+        default=os.environ.get("AF_DS_PACKET_DIAGNOSTICS", "").strip().lower()
+        in ("1", "true", "yes", "on"),
+        help="decrypt and log every relayed packet (off by default to reduce host-side jitter)",
+    )
 
     ap.add_argument("--lazy-spawn", action="store_true")
     ap.add_argument("--python-exe", default=sys.executable)
@@ -375,7 +404,7 @@ def main():
     ap.add_argument("--loader-pid-file", default="")
     ap.add_argument("--loader-log", default="")
     ap.add_argument("--state-file", default="")
-    ap.add_argument("--startup-timeout", type=float, default=90.0)
+    ap.add_argument("--startup-timeout", type=float, default=120.0)
     ap.add_argument("--buffer-max-packets", type=int, default=256)
     ap.add_argument("--buffer-max-bytes", type=int, default=512 * 1024)
     ap.add_argument("--buffer-max-age", type=float, default=45.0)
@@ -398,7 +427,8 @@ def main():
     listen_port = int(args.listen_port)
     target = (args.target_host, int(args.target_port))
     ACTOR_DUMP_PATH = Path(args.actor_dump).resolve()
-    ACTOR_DUMP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if args.packet_diagnostics:
+        ACTOR_DUMP_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     state_file = Path(args.state_file).resolve() if args.state_file else None
     ready_file = Path(args.ready_file).resolve() if args.ready_file else None
@@ -451,7 +481,8 @@ def main():
             else:
                 state_write_failures = 0
 
-    append_actor_dump("\n=== NEW BRIDGE-v9 MULTI-PEER LATCH SESSION %.6f ===" % time.time())
+    if args.packet_diagnostics:
+        append_actor_dump("\n=== NEW BRIDGE-v9 MULTI-PEER LATCH SESSION %.6f ===" % time.time())
     cs = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     cs.bind((listen_ip, listen_port))
     disable_udp_connreset(cs)
@@ -459,9 +490,16 @@ def main():
     publish(state="LISTENING")
     print(f"[BRIDGE-v9.2] lazy relay listening {listen_ip}:{listen_port} -> {target[0]}:{target[1]}", flush=True)
     print(f"[BRIDGE-v9.2] AFDEV=OFF; first valid AF DS/UE3 client UDP packet triggers v48", flush=True)
-    print(f"[BRIDGE-v9] diagnostic decode key = {DECODE_KEY.hex()}", flush=True)
     print("[BRIDGE-v9] upstream sockets are allocated per client peer", flush=True)
-    print(f"[BRIDGE-v9] actor payload log = {ACTOR_DUMP_PATH}", flush=True)
+    if args.packet_diagnostics:
+        print(f"[BRIDGE-v9] diagnostic decode key = {DECODE_KEY.hex()}", flush=True)
+        print(f"[BRIDGE-v9] actor payload log = {ACTOR_DUMP_PATH}", flush=True)
+    else:
+        print(
+            "[BRIDGE-v9] packet diagnostics disabled; set AF_DS_PACKET_DIAGNOSTICS=1 "
+            "or pass --packet-diagnostics to enable",
+            flush=True,
+        )
 
     # r10/v9 multiplayer bridge: one public room endpoint, but one distinct
     # upstream UDP socket per client peer.  AFDEV therefore sees separate source
@@ -563,7 +601,9 @@ def main():
         child_env.setdefault("PYTHONUTF8", "1")
         child_env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        if loader_log:
+        if DS_DIAGNOSTICS:
+            stdout_target = subprocess.PIPE
+        elif loader_log:
             loader_log_handle = loader_log.open("a", encoding="utf-8", buffering=1)
             stdout_target = loader_log_handle
         else:
@@ -593,6 +633,11 @@ def main():
             creationflags=creationflags,
             env=child_env,
         )
+        if DS_DIAGNOSTICS:
+            global LOADER_DIAGNOSTIC_THREAD
+            LOADER_DIAGNOSTIC_TAIL.clear()
+            LOADER_DIAGNOSTIC_THREAD = capture_pipe(loader_proc.stdout, DS_DIAGNOSTICS,
+                *diagnostic_context(), "loader", LOADER_DIAGNOSTIC_TAIL)
         loader_pid_file.write_text(str(loader_proc.pid), encoding="utf-8")
         spawn_started = time.time()
         trigger_client = addr
@@ -643,6 +688,10 @@ def main():
             return
         if loader_proc.poll() is not None:
             detail = f"loader exited rc={loader_proc.returncode}"
+            if DS_DIAGNOSTICS:
+                if LOADER_DIAGNOSTIC_THREAD:
+                    LOADER_DIAGNOSTIC_THREAD.join(timeout=1)
+                detail += "; loader_log_tail=" + " | ".join(LOADER_DIAGNOSTIC_TAIL)[-3500:]
             # r14 diagnostics: surface the loader's actual failure in the bridge
             # error instead of forcing the user to hunt a second file.
             try:
@@ -774,8 +823,14 @@ def main():
                     except ConnectionResetError as exc:
                         print(f"[C->S] UDP reset ignored: {exc}", flush=True)
                         continue
+                    wire = nickname_rewriter.rewrite(wire, addr)
                     c2s += 1
-                    print(f"[C->S #{c2s}] peer={addr[0]}:{addr[1]} {summarize('C->S', wire)}", flush=True)
+                    if args.packet_diagnostics:
+                        print(
+                            f"[C->S #{c2s}] peer={addr[0]}:{addr[1]} "
+                            f"{summarize('C->S', wire)}",
+                            flush=True,
+                        )
 
                     pstate = peers.get(addr)
                     if pstate is None:
@@ -832,7 +887,12 @@ def main():
                     if src != target:
                         continue
                     s2c += 1
-                    print(f"[S->C #{s2c}] peer={addr[0]}:{addr[1]} {summarize('S->C', wire)}", flush=True)
+                    if args.packet_diagnostics:
+                        print(
+                            f"[S->C #{s2c}] peer={addr[0]}:{addr[1]} "
+                            f"{summarize('S->C', wire)}",
+                            flush=True,
+                        )
                     if args.lazy_spawn and not pstate.get("live"):
                         pstate["live"] = True
                         pstate["latched_wire"] = None

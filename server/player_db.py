@@ -139,6 +139,24 @@ class PlayerDatabase:
                     CREATE INDEX IF NOT EXISTS idx_player_inventory_uin_item
                         ON player_inventory(uin, item_id);
 
+                    CREATE TABLE IF NOT EXISTS player_moneyflow (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        uin INTEGER NOT NULL CHECK (uin >= 10001),
+                        occurred_at INTEGER NOT NULL CHECK (occurred_at >= 0),
+                        money_type INTEGER NOT NULL CHECK (money_type BETWEEN 1 AND 3),
+                        number INTEGER NOT NULL,
+                        current_balance INTEGER NOT NULL CHECK (current_balance >= 0),
+                        reason INTEGER NOT NULL CHECK (reason BETWEEN 0 AND 255),
+                        details TEXT NOT NULL DEFAULT '',
+                        commodity_ids TEXT NOT NULL DEFAULT '[]',
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY (uin) REFERENCES player_profiles(uin)
+                            ON DELETE CASCADE
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_player_moneyflow_uin_id
+                        ON player_moneyflow(uin, id);
+
                     CREATE INDEX IF NOT EXISTS idx_player_profiles_nickname_nocase
                         ON player_profiles(nickname COLLATE NOCASE)
                         WHERE nickname IS NOT NULL AND nickname <> '';
@@ -176,7 +194,7 @@ class PlayerDatabase:
                     )
                 conn.execute(
                     "INSERT OR REPLACE INTO meta(key, value) "
-                    "VALUES('player_state_schema_version', '3')"
+                    "VALUES('player_state_schema_version', '4')"
                 )
                 conn.commit()
             finally:
@@ -461,9 +479,112 @@ class PlayerDatabase:
         finally:
             conn.close()
 
-    def save_player_state(self, uin: int, state: Mapping[str, Any], *, reason: str = "update") -> None:
+    @staticmethod
+    def _normalize_moneyflow_rows(rows) -> list[dict[str, Any]]:
+        normalized = []
+        for raw in rows or ():
+            row = dict(raw)
+            money_type = int(row.get("money_type", 0))
+            if money_type not in (1, 2, 3):
+                raise PlayerDBError(
+                    f"invalid moneyflow money_type={money_type}"
+                )
+            reason = int(row.get("reason", 0))
+            if reason < 0 or reason > 0xFF:
+                raise PlayerDBError(
+                    f"invalid moneyflow reason={reason}"
+                )
+            occurred_at = int(row.get("occurred_at", 0))
+            if occurred_at < 0:
+                raise PlayerDBError(
+                    f"invalid moneyflow occurred_at={occurred_at}"
+                )
+            current_balance = int(row.get("current", row.get("current_balance", 0)))
+            if current_balance < 0:
+                raise PlayerDBError(
+                    f"invalid moneyflow current_balance={current_balance}"
+                )
+            details = str(row.get("details", "") or "")
+            if len(details) > 512:
+                details = details[:512]
+            commodity_ids = [
+                int(value)
+                for value in (row.get("commodity_ids") or ())
+            ]
+            normalized.append(
+                {
+                    "occurred_at": occurred_at,
+                    "money_type": money_type,
+                    "number": int(row.get("number", 0)),
+                    "current_balance": current_balance,
+                    "reason": reason,
+                    "details": details,
+                    "commodity_ids": commodity_ids,
+                }
+            )
+        return normalized
+
+    def load_moneyflow(self, uin: int, *, limit: int = 900) -> list[dict[str, Any]]:
+        """Load the newest persisted Consumer List rows in chronological order."""
+        uin = int(uin)
+        limit = max(0, min(int(limit), 5000))
+        if limit == 0:
+            return []
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT id, occurred_at, money_type, number, current_balance,
+                       reason, details, commodity_ids
+                FROM (
+                    SELECT id, occurred_at, money_type, number, current_balance,
+                           reason, details, commodity_ids
+                    FROM player_moneyflow
+                    WHERE uin = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id ASC
+                """,
+                (uin, limit),
+            ).fetchall()
+            out = []
+            for row in rows:
+                try:
+                    commodity_ids = json.loads(str(row["commodity_ids"] or "[]"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    commodity_ids = []
+                if not isinstance(commodity_ids, list):
+                    commodity_ids = []
+                out.append(
+                    {
+                        "id": int(row["id"]),
+                        "occurred_at": int(row["occurred_at"]),
+                        "money_type": int(row["money_type"]),
+                        "number": int(row["number"]),
+                        "current": int(row["current_balance"]),
+                        "reason": int(row["reason"]),
+                        "details": str(row["details"] or ""),
+                        "commodity_ids": [
+                            int(value) for value in commodity_ids
+                        ],
+                    }
+                )
+            return out
+        finally:
+            conn.close()
+
+    def save_player_state(
+        self,
+        uin: int,
+        state: Mapping[str, Any],
+        *,
+        reason: str = "update",
+        moneyflow_rows=None,
+    ) -> None:
         uin = int(uin)
         normalized = self._normalize_state(state)
+        normalized_moneyflow = self._normalize_moneyflow_rows(moneyflow_rows)
         now = _utc_now()
         conn = self._connect()
         try:
@@ -514,8 +635,36 @@ class PlayerDatabase:
                     now,
                 ),
             )
-            # Wallet + inventory + role/bag commit atomically.
+            # Wallet + inventory + role/bag + Consumer List rows commit
+            # in the same SQLite transaction. A failed purchase never reaches
+            # this call, so it cannot create history.
             self._replace_inventory_conn(conn, uin, normalized["inventory"])
+            if normalized_moneyflow:
+                conn.executemany(
+                    """
+                    INSERT INTO player_moneyflow(
+                        uin, occurred_at, money_type, number, current_balance,
+                        reason, details, commodity_ids, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        (
+                            uin,
+                            row["occurred_at"],
+                            row["money_type"],
+                            row["number"],
+                            row["current_balance"],
+                            row["reason"],
+                            row["details"],
+                            json.dumps(
+                                row["commodity_ids"],
+                                separators=(",", ":"),
+                            ),
+                            now,
+                        )
+                        for row in normalized_moneyflow
+                    ],
+                )
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
                 (f"player_state_last_save:{uin}", json.dumps({"reason": str(reason), "at": now})),
@@ -690,7 +839,13 @@ class PlayerDatabase:
         conn = self._connect()
         try:
             out = {}
-            for table in ("game_identities", "player_profiles", "player_wallets", "player_inventory"):
+            for table in (
+                "game_identities",
+                "player_profiles",
+                "player_wallets",
+                "player_inventory",
+                "player_moneyflow",
+            ):
                 row = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
                 out[table] = int(row["n"])
             return out

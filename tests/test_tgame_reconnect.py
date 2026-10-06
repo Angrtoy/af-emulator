@@ -129,6 +129,53 @@ class TGameReconnectTests(unittest.TestCase):
             )
             self.assertEqual(parsed["uin"], candidates[0]["uin"])
 
+    def test_same_ip_can_hold_multiple_account_sessions(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="af-resume-multisession-") as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "accounts.sqlite3"
+            private_key_path = root / "PRIVATE.PEM"
+            private_key_path.write_bytes(b"test-only-private-key-material-" * 8)
+            ip = "203.0.113.20"
+
+            for uin in (10001, 10002):
+                ticket = issue_ticket(
+                    uin,
+                    ip,
+                    bytes.fromhex("ffeeddccbbaa99887766554433221100"),
+                    db_path=db_path,
+                    private_key_path=private_key_path,
+                )
+                self.assertTrue(
+                    save_transport_key(
+                        ticket,
+                        uin,
+                        ip,
+                        self.key,
+                        db_path=db_path,
+                        private_key_path=private_key_path,
+                    )
+                )
+
+            candidates = get_sessions_for_ip(
+                ip,
+                db_path=db_path,
+                private_key_path=private_key_path,
+            )
+            self.assertEqual({row["uin"] for row in candidates}, {10001, 10002})
+
+            for expected_uin in (10001, 10002):
+                matched = []
+                packet = self._packet(uin=expected_uin)
+                for candidate in candidates:
+                    parsed = parse_cmd06_resume(
+                        packet,
+                        candidate["transport_key"],
+                        _mode3_decrypt,
+                    )
+                    if parsed["uin"] == candidate["uin"]:
+                        matched.append(candidate["uin"])
+                self.assertEqual(matched, [expected_uin])
+
 
 class RoomRestartRecoveryTests(unittest.TestCase):
     def test_restart_keeps_waiting_room_for_live_sessions_only(self) -> None:

@@ -10,6 +10,18 @@
 
 An unofficial **Assault Fire PH** preservation/server-emulation project.
 
+**In-game English translations:** [Install and restore translation corrections](translations/README.md). Report bad or untranslated text using the [translation issue form](https://github.com/armangido/af-emulator/issues/new?template=translation-report.yml).
+
+> [!WARNING]
+> **Anti-scam notice — this emulator is free**
+>
+> The official source for this project is this GitHub repository. The maintainers do **not** sell official builds, licenses, activation keys, required downloads, private access, or paid unlocks for the emulator.
+>
+> If someone claims that you **must pay** to obtain an "official" copy, activate the emulator, unlock required features, receive a required key, or gain access on behalf of this project, **do not pay**. That claim is not authorized by the maintainers and may be an attempt to scam you.
+>
+> This repository uses the MIT License, which permits third parties to redistribute or sell copies or related services under its terms. Paying a third party does **not** make their copy, server, support, or service official, endorsed, or affiliated with this project. The emulator itself is available here for free.
+>
+> When in doubt, verify downloads and instructions against this repository before running files or sending money to anyone.
 
 > [!IMPORTANT]
 > **Server independence disclaimer**
@@ -80,7 +92,7 @@ The script handles the annoying parts for you:
 - creates/verifies the local RSA key pair and installs the matching `APClient.dat`;
 - repairs the three Windows hosts entries;
 - applies the verified datetime patch permanently to **your own `TGame.exe`**, first saving an exact `TGame.exe.bak` backup;
-- creates `TGame_AFDEV.exe` locally from that verified patched `TGame.exe` so PvE does not require a separately distributed AFDEV executable;
+- creates `TGame_AFDEV.exe` locally from that verified patched `TGame.exe`, then installs the verified native **ServerMove v4** patch into the AFDEV copy only, so PvE does not require a separately distributed AFDEV executable;
 - starts the emulator server;
 - waits for preflight to reach **UNLOCKED**;
 - starts the runtime launch helper automatically;
@@ -134,7 +146,9 @@ For safety, the launcher still asks before replacing a mismatched `PRIVATE.PEM`.
 > The one-click script does **not** download or redistribute Assault Fire files.
 > It only works with the game files you already have. It permanently patches a
 > verified local `TGame.exe` and keeps the original as `TGame.exe.bak`. The local
-> `TGame_AFDEV.exe` copy is created from that verified patched file. If the
+> `TGame_AFDEV.exe` copy is created from that verified patched file and receives
+> the verified native ServerMove-v4 patch locally. The normal client `TGame.exe`
+> is not replaced by the ServerMove tool. If the
 > signature is at a different RVA, it must be the only matching executable-
 > section signature. The patcher uses a safe code cave or adds a dedicated
 > executable section when the PE headers have an unused section-header slot.
@@ -1015,7 +1029,9 @@ $env:AF_GAME_DIR = "D:\AssaultFirePH\Binaries\Win32"
 
 When a PvE room starts, the emulator handles the dedicated-server lifecycle automatically.
 
-You do not normally start AFDEV manually.
+The local AFDEV copy also receives the verified native ServerMove-v4 patch automatically. The loader validates the live restored body and now refuses to start gameplay if the local AFDEV copy still has the stripped stock stub; the old runtime movement fallback has been removed. Steel/TGIF startup temporarily keeps the stock stripped ServerMove stub during map `OPEN`, then restores v4 after LoadMap stage 7 before the client is released.
+
+You do not normally start AFDEV or run the ServerMove patcher manually.
 
 More details for developers: [PvE Runtime](docs/PVE_RUNTIME.md).
 
@@ -1192,18 +1208,20 @@ See [Vital Setup Notes](docs/VITAL_SETUP_NOTES.md).
 
 The public stable baseline is **v143b**.
 
-Working/integrated areas include VERSION, AUTH, DIR, ROLE, ZONE, existing/local profile login, shared rooms, dynamic room work, PvE dedicated-server allocation/lifecycle, stock-selected PvE map/settings propagation, lazy AFDEV startup, inventory/shop/profile preservation work, and the current local AP synchronization path.
+Working/integrated areas include VERSION, AUTH, DIR, ROLE, ZONE, existing/local profile login, shared rooms, dynamic room work, PvE dedicated-server allocation/lifecycle, stock-selected PvE map/settings propagation, lazy AFDEV startup, the live-verified native ServerMove-v4 AFDEV path, inventory/shop/profile preservation work, and the live-verified native A50E AP/TP refresh path.
 
 Local username/password registration is available through the development
 website described above. First-time in-game nickname creation and parts of the
 social/progression systems are still incomplete or being validated.
 
 > [!IMPORTANT]
-> AP initialization currently uses a temporary local-only workaround on PH v1.0.0.24.
+> PH v1.0.0.24 native AP refresh is live-verified. The stock AP reload button sends A50E; the emulator reloads the authoritative persisted wallet and publishes wallet values through the recovered A00A UpdatePlayerProperty schema.
 >
-> The server wallet and normal AP purchases remain authoritative, but the stock client's native initial AP/GamePoint population is not yet fully recovered.
+> The same refresh boundary now republishes AP, GP, and MP with the recovered bitmask flags: AP/TP `0x01`, GP `0x02`, and MP `0x10`. AP is live-verified; the GP/MP extension is implemented from the same recovered schema and should be live-checked with distinctive admin values.
 >
-> The emulator currently copies the persisted AP balance into the verified local player field once per `TGame.exe` process. Disable this with `AF_LOCAL_AP_SYNC=0` only if you know why you are doing it.
+> A50E is a read/synchronization operation only. Website/admin wallet changes are the write side; repeated in-game refresh clicks do not grant or increment currency.
+>
+> The protocol finding is not AP-specific: UpdatePlayerProperty uses bitmask flags and a schema-sensitive A00A route. See [Research Findings](docs/RESEARCH_FINDINGS.md) and Issue #57 before adding new GP/MP/EXP/property producers.
 
 For the detailed matrix, read [Project Status](docs/STATUS.md).
 

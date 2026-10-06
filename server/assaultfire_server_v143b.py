@@ -46,11 +46,35 @@ from assaultfire_preflight import (
     run_server_preflight,
     update_launch_gate_status,
 )
-from assaultfire_logging import build_logger
+from assaultfire_database_logging import build_logger
 from assaultfire_auth import parse_client_dh_plaintext
 from assaultfire_boot import resolve_private_key_path, server_only_requested
-from local_ap_sync import LocalAPSync
 from player_db import DEFAULT_DB_PATH as PLAYER_DB_PATH, PlayerDatabase, PlayerDBError
+from friends_service import (
+    A310_WIRE_RECOVERY,
+    EPTE_ADD_BY_ALL,
+    SNS_ERR_SUCC,
+    FriendsError,
+    FriendsService,
+    build_add_friend_result,
+    build_chat_p2p_notify,
+    build_delete_friend_response,
+    build_friend_invite,
+    build_friend_status_response,
+    build_query_friend_response,
+    parse_add_friend_client_response,
+    parse_add_friend_request,
+    parse_chat_p2p_request,
+    parse_delete_friend_request,
+    parse_friend_status_request,
+    parse_query_friend_request,
+    build_friend_loginout,
+    build_player_exp_response,
+    parse_player_exp_request,
+    parse_read_offline_message_notice,
+)
+from clan_db import ClanDatabase
+from clan_service import ClanService, COMMANDS as CLAN_COMMANDS, SENSITIVE_COMMANDS as CLAN_SENSITIVE_COMMANDS
 from development_web import (
     DevelopmentWebError,
     DevelopmentWebProcess,
@@ -61,7 +85,13 @@ from assaultfire_ap_auth import (
     authenticate_ap_verify_body,
     build_ap_result_plaintext,
 )
+
+# Hosted reconnect persistence: keep sessions alive long enough for rolling
+# updates/restarts. Operators can still override this in the environment.
+os.environ.setdefault("AF_TGAME_SESSION_TTL_SECONDS", "3600")
+
 from tgame_ticket_state import (
+    SESSION_TTL_SECONDS,
     get_unexpired_session_uins,
     get_sessions_for_ip,
     get_ticket_crypto,
@@ -70,6 +100,14 @@ from tgame_ticket_state import (
     touch_session,
 )
 from tgame_reconnect import parse_cmd06_resume
+
+try:
+    TGAME_SESSION_TOUCH_INTERVAL_SECONDS = max(
+        15.0,
+        min(300.0, float(os.environ.get("AF_TGAME_SESSION_TOUCH_SECONDS", "60"))),
+    )
+except (TypeError, ValueError):
+    TGAME_SESSION_TOUCH_INTERVAL_SECONDS = 60.0
 
 # v24: v20 success framing plus BOTH PublicData bitmap and PrivateData tail probes.
 QUIET_ROLE_HEX = True
@@ -103,6 +141,39 @@ V139_WIRE_BINDINGS = ({'owner': 'TGOnlineClient', 'name': 'OnlineRequest_CreateA
 V139_PROTOCOL_ONLY = {40960: ('Protocol.Login', 'CURRENT_BRANCH'), 40964: ('Protocol.Heartbeat', 'CURRENT_BRANCH'), 40968: ('Protocol.PropOperation', 'CURRENT_BRANCH'), 41888: ('Protocol.StartRoomAlloc', 'CURRENT_BRANCH'), 41891: ('Protocol.QuitRoomAlloc', 'MAPPED_ONLY'), 65285: ('Protocol.UnknownFF05', 'CURRENT_BRANCH')}
 V139_CURRENT_HANDLER_IDS = frozenset((40960, 40962, 40964, 40968, 41216, 41223, 41226, 41229, 41232, 41235, 41239, 41244, 41246, 41266, 41731, 41813, 41888, 65285))
 
+
+
+# PH clan metadata and October 5 captures; see docs/CLANS.md for live status.
+V139_WIRE_BINDINGS = tuple(
+    b for b in V139_WIRE_BINDINGS
+    if (b["owner"], b["name"]) not in {('TGOnlineTeamRoom', 'OnlineRequest_TeamIntroduction'), ('TGOnlineTeamRoom', 'OnlineRequest_GetOtherTeamInfo'), ('TGOnlineTeamRoom', 'OnlineRequest_ApproveJoinResult'), ('TGOnlineTeamRoom', 'OnlineRequest_FireMember'), ('TGOnlineTeamRoom', 'OnlineRequest_ApproveList'), ('TGOnlineTeamRoom', 'OnlineRequest_CreateTeam'), ('TGOnlineTeamRoom', 'OnlineRequest_GetDetailTeamInfo'), ('TGOnlineTeamRoom', 'OnlineRequest_QuitTeam'), ('TGOnlineTeamRoom', 'OnlineRequest_GetMemberList'), ('TGOnlineTeamRoom', 'OnlineRequest_ApplyToJoinTeam'), ('TGOnlineTeamRoom', 'OnlineRequest_SearchTeamByName'), ('TGOnlineTeamRoom', 'OnlineRequest_CheckTeamName')}
+)
+V139_WIRE_BINDINGS += (
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_CreateTeam', 'cmd': 45057, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan macro/structure metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_SearchTeamByName', 'cmd': 45061, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan macro/structure metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_GetDetailTeamInfo', 'cmd': 45065, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan macro/structure metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_GetMemberList', 'cmd': 45067, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan macro/structure metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_GetOtherTeamInfo', 'cmd': 45069, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan macro/structure metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_CheckTeamName', 'cmd': 45071, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan macro/structure metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_ApplyToJoinTeam', 'cmd': 45075, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan macro/structure metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_ApproveList', 'cmd': 45077, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan macro/structure metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_ApproveJoinResult', 'cmd': 45081, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan macro/structure metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_FireMember', 'cmd': 45086, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan macro/structure metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_QuitTeam', 'cmd': 45092, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan macro/structure metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_TeamIntroduction', 'cmd': 45184, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan macro/structure metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_ConfirmJoin', 'cmd': 45079, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_InvitePlayerJoin', 'cmd': 45099, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_PromotionMember', 'cmd': 45088, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_DemotionMember', 'cmd': 45090, 'status': 'CURRENT_PARTIAL', 'source': 'PH proto_c2zn.tdr clan metadata', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_DissolveTeam', 'cmd': 0xB039, 'status': 'CURRENT_PARTIAL', 'source': 'October 5 PH capture and TDR schema', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_ExtendTeam', 'cmd': 0xB025, 'status': 'CURRENT_PARTIAL', 'source': 'October 5 PH capture + metalib', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_GetBulletin', 'cmd': 0xB02D, 'status': 'CURRENT_PARTIAL', 'source': 'October 5 PH capture + metalib', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_SetBulletin', 'cmd': 0xB02F, 'status': 'CURRENT_PARTIAL', 'source': 'October 5 PH capture + metalib', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_BuyBadge', 'cmd': 0xB04A, 'status': 'CURRENT_PARTIAL', 'source': 'October 5 PH capture + metalib', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_SetBadge', 'cmd': 0xB04E, 'status': 'CURRENT_PARTIAL', 'source': 'PH metalib; badge setting confirmed in client', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_GetBadgeList', 'cmd': 0xB050, 'status': 'CURRENT_PARTIAL', 'source': 'October 5 PH capture + metalib', 'implemented': True},
+    {'owner': 'TGOnlineTeamRoom', 'name': 'OnlineRequest_GetTeamMemberGroupList', 'cmd': 0xB08A, 'status': 'CURRENT_PARTIAL', 'source': 'October 5 PH capture + metalib', 'implemented': True},
+)
 
 def _v139_sig(spec):
     params = ", ".join(
@@ -160,6 +231,33 @@ def _v139_build_registry():
 
 
 V139_PROTOCOL_REGISTRY = _v139_build_registry()
+
+# v165: active recovered social request family.
+_V165_FRIEND_BINDINGS = (
+    (0xA305, ("TGOnlineClient", "OnlineRequest_ReqAddFriend")),
+    (0xA307, ("TGOnlineClient", "OnlineRequest_ResAddFriend")),
+    (0xA309, ("TGOnlineClient", "OnlineRequest_DeleteFriend")),
+    (0xA30F, ("TGOnlineClient", "OnlineRequest_QueryFriend")),
+    (0xA405, ("TGOnlineClient", "OnlineRequest_ChatP2P")),
+    (0xA33A, ("TGOnlineClient", "OnlineRequest_GetPlayerExps")),
+)
+for _v165_cmd, _v165_key in _V165_FRIEND_BINDINGS:
+    _v165_base = V139_PROTOCOL_REGISTRY["by_key"].get(_v165_key)
+    if _v165_base is not None:
+        _v165_spec = dict(_v165_base)
+        _v165_spec.update(
+            {
+                "cmd": _v165_cmd,
+                "status": "CURRENT_PARTIAL",
+                "source": "v165-current-main-friends-bootstrap",
+                "implemented": True,
+            }
+        )
+        V139_PROTOCOL_REGISTRY["by_cmd"][_v165_cmd] = _v165_spec
+V139_CURRENT_HANDLER_IDS = frozenset(
+    set(V139_CURRENT_HANDLER_IDS)
+    | {cmd for cmd, _key in _V165_FRIEND_BINDINGS}
+)
 
 
 def _v139_lookup_wire(cmd):
@@ -519,6 +617,233 @@ def _v143b_tdr_ipv4(host):
     return int.from_bytes(packed, "little")
 
 
+# v177: transient friend room invitations; relationship remains in SQLite.
+_V177_ROOM_INVITES = {}
+_V177_INVITE_SEQUENCE = 0
+
+
+def _v177_friend_location(uin):
+    session = _v150_session_snapshot(uin)
+    if session is None:
+        return None, None, bytes(24)
+    room = V150_ROOM_REGISTRY.room_for_player(uin)
+    state = session.get('role_state') or {}
+    main = int(state.get('main_channel_id') or 1)
+    sub = int((room or {}).get('sub_channel_id') or state.get('sub_channel_id') or 1)
+    address = (_v48_u32(main) + _v48_u32(sub)
+               + _v48_u64((room or {}).get('room_id', 0))
+               + _v48_u16((room or {}).get('display_id', 0))
+               + _v48_u32((room or {}).get('mode_id', 0))
+               + _v48_u16((room or {}).get('map_id', 0)))
+    return session, room, address
+
+
+def _v177_room_invitable(room):
+    return (room is not None and not room.get('started')
+            and int(room.get('fighter_count', 0)) < int(room.get('fighter_capacity', 0)))
+
+
+def _v178_parse_trace_enter(body, role_state):
+    if len(body) < 23:
+        raise ValueError('truncated A120')
+    room_id = struct.unpack_from('>Q', body)[0]
+    password, _, off = _v79_read_lp_string(body, 8, 8)
+    if off + 10 != len(body):
+        raise ValueError('invalid A120 tail')
+    kind, friend = struct.unpack_from('>HQ', body, off)
+    actor = _v150_role_uin(role_state)
+    _, room, _ = _v177_friend_location(friend)
+    if not room or int(room['room_id']) != room_id:
+        raise ValueError('friend moved out of requested room')
+    if not FRIENDS_SERVICE.are_friends(actor, friend):
+        raise ValueError('trace target is not a friend')
+    invite_id = None
+    if kind == 2:
+        with _V150_ZONE_LOCK:
+            invite_id = next((rid for rid, entry in _V177_ROOM_INVITES.items()
+                if entry['sender'] == friend and entry['recipient'] == actor
+                and int(entry['room']) == room_id
+                and entry['expires'] > time.monotonic()), None)
+        if invite_id is None or not _v177_room_invitable(room):
+            raise ValueError('no valid invitation for requested room')
+        # A bound room invitation authorizes entering its password-protected room.
+        password = str(room.get('password') or '')
+    elif kind != 1:
+        raise ValueError('unsupported trace entry type')
+    return dict(room_id=room_id, password=password, observer=False,
+                tail=b'', invite_id=invite_id, inviter=friend)
+
+
+def _v177_friend_action(conn, key, label, role_state, app):
+    global _V177_INVITE_SEQUENCE
+    cmd, body = app['cmd'], bytes(app['body'])
+    actor = _v150_role_uin(role_state)
+    target = 0
+    response = None
+    try:
+        if cmd == 0xA317:
+            if len(body) != 10:
+                raise ValueError('A317 requires Type:u16 and FriendUin:u64')
+            kind, target = struct.unpack('>HQ', body)
+            session, room, address = _v177_friend_location(target)
+            allowed = kind == 1 and FRIENDS_SERVICE.are_friends(actor, target)
+            result = 0x8300 if allowed and session else (0x030C if not allowed else 0x0306)
+            if result != 0x8300:
+                address = bytes(24)
+            response = _v62_build_server_app(TGAME_ZN_MAGIC, 0xA318,
+                _v48_u64(target) + address + _v48_u16(result))
+        elif cmd == 0xA313:
+            if len(body) != 8:
+                raise ValueError('A313 requires FriendUin:u64')
+            target = struct.unpack('>Q', body)[0]
+            identity = FRIENDS_SERVICE.get_player_identity(target)
+            target_name = str((identity or {}).get('nickname') or '')
+            sender_session, room, address = _v177_friend_location(actor)
+            recipient_session, recipient_room, _ = _v177_friend_location(target)
+            result = 0x0300
+            if not FRIENDS_SERVICE.are_friends(actor, target):
+                result = 0x030B
+            elif recipient_session is None:
+                result = 0x0306
+            elif not _v177_room_invitable(room) or recipient_room is not None:
+                result = 0x030F
+            else:
+                now = time.monotonic()
+                with _V150_ZONE_LOCK:
+                    for rid, entry in list(_V177_ROOM_INVITES.items()):
+                        if entry['expires'] <= now:
+                            del _V177_ROOM_INVITES[rid]
+                    # Repeated outstanding invitations reuse their bound ID.
+                    existing = next(((rid, entry) for rid, entry in _V177_ROOM_INVITES.items()
+                        if entry['sender'] == actor and entry['recipient'] == target
+                        and entry['room'] == room['room_id']), None)
+                    if existing:
+                        request_id = existing[0]
+                    else:
+                        if len(_V177_ROOM_INVITES) >= 4096:
+                            raise ValueError('room invitation queue full')
+                        _V177_INVITE_SEQUENCE = (_V177_INVITE_SEQUENCE + 1) & 0xFFFFFFFF or 1
+                        while _V177_INVITE_SEQUENCE in _V177_ROOM_INVITES:
+                            _V177_INVITE_SEQUENCE = (_V177_INVITE_SEQUENCE + 1) & 0xFFFFFFFF or 1
+                        request_id = _V177_INVITE_SEQUENCE
+                        _V177_ROOM_INVITES[request_id] = dict(sender=actor, recipient=target,
+                            room=room['room_id'], expires=now+120)
+                invite_address = address[:8] + _v150_pack_basic_match_room_info(room)
+                packet = _v62_build_server_app(TGAME_ZN_MAGIC, 0xA314,
+                    _v48_u32(request_id) + _v48_u64(actor)
+                    + _v50_geo_tdr_string(_v150_role_nickname(role_state), 32) + invite_address)
+                if _v150_send_online(target, packet, f'friend room invite id={request_id} from={actor}'):
+                    return
+                with _V150_ZONE_LOCK:
+                    _V177_ROOM_INVITES.pop(request_id, None)
+                result = 0x0306
+            response = _v62_build_server_app(TGAME_ZN_MAGIC, 0xA316,
+                _v50_geo_tdr_string(target_name, 32) + _v48_u16(result) + _v48_u32(0))
+        elif cmd == 0xA315:
+            if len(body) != 18:
+                raise ValueError('A315 requires request ID, inviter UIN, result and reason')
+            request_id, inviter, result, reason = struct.unpack('>IQHi', body)
+            with _V150_ZONE_LOCK:
+                pending = _V177_ROOM_INVITES.get(request_id)
+                if (not pending or pending['sender'] != inviter or pending['recipient'] != actor
+                        or pending['expires'] <= time.monotonic()):
+                    raise ValueError('invalid or expired room invitation')
+                if result not in (0x0309, 0x0308, 0x030F):
+                    raise ValueError('invalid invitation decision')
+                if result != 0x0309:
+                    del _V177_ROOM_INVITES[request_id]
+            # The stock client joins via its ordinary room-entry request; never
+            # bypass capacity, password, started-match or room admission checks.
+            _, current_room, _ = _v177_friend_location(inviter)
+            if result == 0x0309 and (not _v177_room_invitable(current_room)
+                    or current_room['room_id'] != pending['room']
+                    or not FRIENDS_SERVICE.are_friends(actor, inviter)):
+                result = 0x030F
+            packet = _v62_build_server_app(TGAME_ZN_MAGIC, 0xA316,
+                _v50_geo_tdr_string(_v150_role_nickname(role_state), 32)
+                + _v48_u16(result) + _v48_i32(reason))
+            _v150_send_online(inviter, packet, f'friend invite decision id={request_id} from={actor}')
+            return
+    except Exception as exc:
+        log('SOCIAL', f'friend action cmd=0x{cmd:04X} actor={actor}: {type(exc).__name__}: {exc}')
+        if cmd == 0xA317:
+            response = _v62_build_server_app(TGAME_ZN_MAGIC, 0xA318,
+                _v48_u64(target) + bytes(24) + _v48_u16(0x030C))
+        elif cmd == 0xA313:
+            response = _v62_build_server_app(TGAME_ZN_MAGIC, 0xA316,
+                _v50_geo_tdr_string('', 32) + _v48_u16(0x0300) + _v48_u32(0))
+    if response is not None:
+        _v48_send_app(conn, key, response, label, f'friend action response cmd=0x{cmd:04X}')
+
+
+def _v165_online_uins():
+    with _V150_ZONE_LOCK:
+        return {int(uin) for uin in _V150_ZONE_SESSIONS}
+
+
+def _v165_deliver_pending_social(uin):
+    uin = int(uin)
+    invite_count = 0
+    message_count = 0
+
+    for req in FRIENDS_SERVICE.list_pending_friend_requests(uin):
+        proposer = FRIENDS_SERVICE.get_player_identity(int(req["from_uin"]))
+        if proposer is None:
+            continue
+        pkt = build_friend_invite(
+            request_id=int(req["request_id"]),
+            proposer_uin=int(req["from_uin"]),
+            proposer_name=str(proposer["nickname"]),
+            remark=str(req.get("remark") or ""),
+            msg_id=int(req.get("msg_id") or req["request_id"]),
+        )
+        if _v150_send_online(
+            uin,
+            pkt,
+            "ZN2C_REQ_ADDFRIEND v165-real "
+            f"request_id={int(req['request_id'])} "
+            f"from={proposer['nickname']}({int(req['from_uin'])})",
+        ):
+            invite_count += 1
+
+    for msg in FRIENDS_SERVICE.list_pending_private_messages(uin):
+        pkt = build_chat_p2p_notify(
+            int(msg["chat_type"]),
+            str(msg["message"]),
+            sender_uin=int(msg["sender_uin"]),
+            sender_name=str(msg.get("sender_nickname") or ""),
+        )
+        if _v150_send_online(
+            uin,
+            pkt,
+            "ZN2C_NTF_CHATP2P v165-real "
+            f"offline-id={int(msg['message_id'])} "
+            f"from={msg.get('sender_nickname')!r}({int(msg['sender_uin'])})",
+        ):
+            FRIENDS_SERVICE.mark_private_message_delivered(int(msg["message_id"]))
+            message_count += 1
+
+    return invite_count, message_count
+
+
+def _v165_seed_friend_rows(uin, friends):
+    sent = 0
+    for friend in friends or []:
+        pkt = build_add_friend_result(
+            friend_uin=int(friend["uin"]),
+            friend_name=str(friend["nickname"]),
+            result=0x8301,  # SNS_ADDFRID_AGREE
+            msg_id=0,
+        )
+        if _v150_send_online(
+            int(uin),
+            pkt,
+            "ZN2C_RES_ADDFRIEND v168-seed-agree "
+            f"friend={friend['nickname']}({int(friend['uin'])})",
+        ):
+            sent += 1
+    return sent
+
 def _v143b_reserve_room_ds(role_state, create_req):
     if not V143B_DS_CONFIG.enabled:
         return None
@@ -528,11 +853,10 @@ def _v143b_reserve_room_ds(role_state, create_req):
         "1", "true", "yes", "on"
     )
     client_map = str(create_req.get("map_string") or "").strip()
-    map_name = (
-        client_map
-        if (use_client_map and client_map)
-        else V143B_DS_CONFIG.default_map
-    )
+    if use_client_map:
+        map_name = client_map or None
+    else:
+        map_name = V143B_DS_CONFIG.default_map
     max_players = max(2, int(create_req.get("fighter_capacity") or 0))
 
     allocation = V143B_DS_SPAWNER.reserve_lobby(
@@ -938,6 +1262,14 @@ _R12_NEXT_UID = 10001
 
 # One SQLite file remains authoritative for accounts and game persistence.
 PLAYER_DB = PlayerDatabase()
+FRIENDS_SERVICE = FriendsService(PLAYER_DB.db_path)
+CLAN_DB = ClanDatabase(PLAYER_DB.db_path)
+CLAN_SERVICE = ClanService(
+    CLAN_DB, is_online=lambda uin: _v150_session_snapshot(uin) is not None,
+    send_notification=lambda uin, cmd, body: _v150_send_online(
+        uin, _v62_build_server_app(TGAME_ZN_MAGIC, cmd, body),
+        f'CLAN notification cmd=0x{cmd:04X} uin={uin}'),
+)
 
 
 def _r12_uid_for_client_pid(pid):
@@ -3010,6 +3342,12 @@ TGAME_ZN_NTF_ZONE_HINTS = 0xFF13
 TGAME_ZN_REQ_CHANGE_NICKNAME = 0xF301
 TGAME_ZN_RES_CHANGE_NICKNAME_TEST = 0xF302
 
+# v160: statically recovered stock-PH action-card request/response pairs.
+TGAME_ZN_REQ_CLEAR_MATCH_RECORD = 0xF303
+TGAME_ZN_RES_CLEAR_MATCH_RECORD = 0xF304
+TGAME_ZN_REQ_CLEAR_MATCH_WINLOSE = 0xF305
+TGAME_ZN_RES_CLEAR_MATCH_WINLOSE = 0xF306
+
 # v72: room-allocation family recovered from proto_c2zn.tdr and confirmed
 # by the live 46-byte Start request emitted by the Match -> Start button.
 TGAME_ZN_REQ_STARTROOMALLOC = 0xA3A0
@@ -3031,6 +3369,29 @@ TGAME_DS_KEY = b"\x00" * 16  # live AFDEV listen-server dynamic key; exactly 16 
 #
 # This restores the packet-observation/translation point that v132 accidentally
 # bypassed by advertising AFDEV:7777 directly in A11A.
+# v165: recovered friend and private-chat command IDs.
+TGAME_ZN_RES_FRIEND_STATUS = 0xA304
+TGAME_ZN_REQ_ADD_FRIEND = 0xA305
+TGAME_ZN_NTF_ADD_FRIEND = 0xA306
+TGAME_ZN_C2S_RES_ADD_FRIEND = 0xA307
+TGAME_ZN_S2C_RES_ADD_FRIEND = 0xA308
+TGAME_ZN_REQ_DEL_FRIEND = 0xA309
+TGAME_ZN_RES_DEL_FRIEND = 0xA30A
+TGAME_ZN_REQ_QUERY_FRIEND = 0xA30F
+TGAME_ZN_RES_QUERY_FRIEND = 0xA310
+TGAME_ZN_NTF_FRIEND_LOGINOUT = 0xA326
+TGAME_ZN_REQ_PLAYER_EXP = 0xA33A
+TGAME_ZN_RES_PLAYER_EXP = 0xA33B
+TGAME_ZN_NTF_READ_OFFLINE_MSG = 0xAB03
+FRIEND_PRESENCE_INBOX_PATCH = "v171-presence-01-no-login-a308-seed"
+FRIEND_PRESENCE_EDGE_PATCH = "v172-a326-edge-trigger-no-a303-loop"
+FRIEND_PRESENCE_ENUM_PATCH = "v173-friend-presence-enum-1-2"
+FRIEND_PRESENCE_SPLIT_PATCH = "v174-split-a304-status-a326-online-type"
+FRIEND_PRESENCE_TRANSPORT_PATCH = "v175-a326-cmd02-notification"
+FRIEND_ENRICHMENT_PATCH = "v170b-static-a326-a33b-friend-presence-exp"
+TGAME_ZN_REQ_CHAT_P2P = 0xA405
+TGAME_ZN_NTF_CHAT_P2P = 0xA406
+
 TGAME_PVE_MODE_ID = 0x00002001  # legacy compatibility alias
 TGAME_AFDEV_MODE_IDS = frozenset(AFDEV_MODE_IDS)
 TGAME_PVE_DIRECT_AFDEV = os.environ.get(
@@ -3434,6 +3795,43 @@ V129_SOFIA_HAIR_ITEM_ID = 100602
 # PVE skill ownership is a real PlayerPropInfo, not PlayerInfo.SkillScore.
 R20_STRENGTH_ITEM_ID = 100049
 
+# PVE-SKILL-PROGRESSION-v2
+# Stock TGOnlinePlayerData.GetAllSkillItemInfos() exposes these as the normal
+# level-progression skills (UnlockWay_1 == 1). The client marks a skill owned
+# only when a matching PlayerPropInfo exists.
+#
+# required_level is the level shown by the client. min_total_exp is the
+# cumulative legacy Assault Fire / NZ EXP threshold for that level. We use the
+# EXP threshold because Experience is the authoritative value persisted by the
+# emulator and is what the stock client uses to derive PlayerLevel.
+#
+# Rank-127 / event-condition skills are deliberately NOT present here.
+V170_PVE_LEVEL_SKILLS = (
+    # item_id, required_level, min_total_exp, display name
+    (100049, 1,      0, "Strength"),
+    (100043, 3,    720, "Quick Fix"),
+    (100313, 4,   1290, "Emergency surgery"),
+    (100046, 5,   2080, "Last Stand"),
+    (100185, 5,   2080, "Airborne"),
+    (100186, 5,   2080, "Heavy Gunner"),
+    (100189, 5,   2080, "Team Heal"),
+    (100044, 6,   3100, "Wonder Drug"),
+    (100050, 7,   4360, "Physical fitness"),
+    (100314, 7,   4360, "Arms experts"),
+    (100052, 8,   5870, "Mag-Master2"),
+    (100319, 8,   5870, "Invincibility"),
+    (100047, 9,   7640, "Invisibility"),
+    (100317, 9,   7640, "Med Hacker"),
+    (100053, 10,  9710, "Quickhand"),
+    (100187, 10,  9710, "Quick Reload"),
+    (100188, 10,  9710, "Runaway"),
+    (100318, 16, 29550, "Kamikaze"),
+    (100316, 18, 39470, "Skill-master"),
+)
+V170_PVE_LEVEL_SKILL_IDS = frozenset(
+    int(row[0]) for row in V170_PVE_LEVEL_SKILLS
+)
+
 V109_ROLE_GID = ((V109_UIN & 0xffffffff) << 32) | 1
 V109_BAG1_GID = ((V109_UIN & 0xffffffff) << 32) | 2
 V109_BAG2_GID = ((V109_UIN & 0xffffffff) << 32) | 3
@@ -3687,7 +4085,7 @@ V111_INVENTORY = [
 #   A361/A362  shop config hash
 #   A503/A504  commodity-file check/ack
 #   A505/A506  buy commodity
-#   A50E       AP/TP balance query -> A00B wallet update
+#   A50E       AP/TP balance query -> A00A UpdatePlayerProperty wallet update
 #   A008/A009/A00A equip/takeoff/current-role transaction (already live)
 #
 # UTGame.u confirms:
@@ -3700,9 +4098,15 @@ V111_INVENTORY = [
 # C2ZN_ReqPropOperation, so v140 keeps that proven wire path rather than
 # inventing separate command IDs.
 #
-TGAME_ZN_NTF_UPDATE_PLAYER_PROPERTY = 0xA00B
+# PH 1.0.0.24 live validation: A00A is schema-sensitive. The existing 19-byte
+# PropOperation notification and the 36-byte UpdatePlayerProperty notification
+# both route through A00A, with the body/TDR schema selecting the consumer.
+TGAME_ZN_NTF_UPDATE_PLAYER_PROPERTY = 0xA00A
 TGAME_ZN_REQ_ITEM_OPERATION = 0xA200
 TGAME_ZN_RES_ITEM_OPERATION = 0xA201
+# v160: OnlineRequest_UseFunctionCard(int,int) -> A347/A348.
+TGAME_ZN_REQ_USE_CARD = 0xA347
+TGAME_ZN_RES_USE_CARD = 0xA348
 TGAME_ZN_REQ_SHOPCONFHASH = 0xA361
 TGAME_ZN_RES_SHOPCONFHASH = 0xA362
 TGAME_ZN_REQ_DROPPROP = 0xA363
@@ -3712,7 +4116,19 @@ TGAME_ZN_REQ_UPDATECOMMODITYFILE = 0xA503
 TGAME_ZN_RES_UPDATECOMMODITYFILE = 0xA504
 TGAME_ZN_REQ_BUYCOMMODITY = 0xA505
 TGAME_ZN_RES_BUYCOMMODITY = 0xA506
+
+# Consumer List purchase history (public issue #42).
+# Direct compiled proto_c2zn metadata and live PH v1.0.0.24 verification:
+#   ID_ZN2C_NTF_MONEYFLOW = 0xA367
+#   MoneyType TP/AP=1, GP=2, MP=3; EMONEYFLOW_BUY=2.
+TGAME_ZN_NTF_MONEYFLOW = 0xA367
+
 TGAME_ZN_REQ_TP_BALANCE = 0xA50E
+
+MONEYTYPE_TP = 1  # protocol TP == PH client AP
+MONEYTYPE_GP = 2
+MONEYTYPE_MP = 3
+MONEYREASON_BUY = 2
 
 PAY_GP = 1
 PAY_TP = 2       # protocol TP == PH client AP
@@ -3728,13 +4144,14 @@ SHOP_ERR_SHOPCART_EMPTY = 0x820A
 SHOP_ERR_NOTENOUGHMONEY = 0x820B
 SHOP_ERR_PAYTYPE_INVALID = 0x820C
 
-UPDATE_FLAG_TP = 0
-UPDATE_FLAG_GP = 1
-UPDATE_FLAG_EXP = 2
-UPDATE_FLAG_PROP = 3
-UPDATE_FLAG_MP = 4
-UPDATE_REASON_BUY = 0x08
-UPDATE_REASON_TP_BALANCE = 0x30
+# Stock EUPDATEPROPERTYFLAG_* values are bitmasks, not enum ordinals.
+UPDATE_FLAG_TP = 0x01
+UPDATE_FLAG_GP = 0x02
+UPDATE_FLAG_EXP = 0x04
+UPDATE_FLAG_PROP = 0x08
+UPDATE_FLAG_MP = 0x10
+UPDATE_REASON_BUY = 0x08  # retained pending the reason-value audit in issue #57
+UPDATE_REASON_TP_BALANCE = 0x2A
 
 V140_DEFAULT_AP = 100000
 V140_DEFAULT_GP = 100000
@@ -4370,10 +4787,15 @@ class _V140PlayerStateManager:
     def state(self):
         return self.ensure(self.current_uin())
 
-    def save(self, reason="update"):
+    def save(self, reason="update", moneyflow_rows=None):
         uin = self.current_uin()
         state = self.state()
-        self.db.save_player_state(uin, state, reason=reason)
+        self.db.save_player_state(
+            uin,
+            state,
+            reason=reason,
+            moneyflow_rows=moneyflow_rows,
+        )
         return uin
 
     def reload(self, uin=None):
@@ -4449,15 +4871,7 @@ def _v140_wallet():
     return w
 
 
-# TEMPORARY PH 1.0.0.24 compatibility workaround.
-# Native initial AP/GamePoint population is still unresolved.  This local-only
-# helper seeds the already-verified client GamePoint field from the
-# authoritative persisted server wallet.  Remove after the native path is
-# implemented (tracked in docs/MILESTONES.md).
-_V143V_LOCAL_AP_SYNC = LocalAPSync(_V140_PLAYER_STATE.wallet_for_local_sync)
-
-
-def _v140_save_state(reason="update"):
+def _v140_save_state(reason="update", moneyflow_rows=None):
     V140_MALL_STATE["version"] = 1
     V140_MALL_STATE["inventory"] = [dict(p) for p in V111_INVENTORY]
     V140_MALL_STATE["current_role_gid"] = int(_v140_current_role_gid())
@@ -4469,10 +4883,14 @@ def _v140_save_state(reason="update"):
         nxt = (max_gid + 1) & 0xFFFFFFFFFFFFFFFF
     V140_MALL_STATE["next_gid"] = nxt
 
-    uin = _V140_PLAYER_STATE.save(reason)
+    uin = _V140_PLAYER_STATE.save(
+        reason,
+        moneyflow_rows=moneyflow_rows,
+    )
     log(
         "MALL-SQLITE",
-        f"v4 state committed transactionally reason={reason} uin={uin} "
+        f"v5 state committed transactionally reason={reason} uin={uin} "
+        f"moneyflow={len(moneyflow_rows or ())} "
         f"inventory={len(V111_INVENTORY)} "
         f"role=0x{_v140_current_role_gid():016x} "
         f"bag=0x{_v141_current_bag_gid():016x} "
@@ -4492,6 +4910,183 @@ def _v140_is_role_item(item_id):
 def _v140_role_slot(item_id):
     loc = int(V140_ITEM_DEFAULT_LOCATIONS.get(int(item_id), -1))
     return loc if loc in (0x0A, 0x0B) else None
+
+
+# PH 1.0.0.24 RawItemDatas: MainShowType=1, Location=0/1/2/7.
+# These sockets belong to a character; the same numbers in a backpack refer
+# to weapons. Do not infer accessory ownership from a socket number alone.
+V173_CHARACTER_ACCESSORY_SLOTS = {
+    100017: 0,
+    100018: 1,
+    100019: 2,
+    100023: 0,
+    100024: 1,
+    100025: 2,
+    100029: 0,
+    100030: 1,
+    100031: 2,
+    100042: 7,
+    100081: 1,
+    100082: 1,
+    100083: 1,
+    100084: 1,
+    100085: 1,
+    100086: 1,
+    100087: 1,
+    100088: 1,
+    100089: 0,
+    100090: 0,
+    100091: 0,
+    100092: 0,
+    100093: 2,
+    100094: 2,
+    100095: 2,
+    100096: 2,
+    100097: 2,
+    100098: 2,
+    100101: 2,
+    100102: 2,
+    100103: 0,
+    100104: 1,
+    100116: 1,
+    100117: 1,
+    100118: 0,
+    100119: 0,
+    100120: 2,
+    100121: 2,
+    100124: 1,
+    100125: 1,
+    100126: 0,
+    100127: 0,
+    100128: 2,
+    100129: 2,
+    100130: 0,
+    100131: 0,
+    100200: 0,
+    100201: 1,
+    100202: 1,
+    100203: 2,
+    100218: 1,
+    100219: 1,
+    100223: 2,
+    100224: 0,
+    100226: 0,
+    100230: 1,
+    100264: 0,
+    100265: 0,
+    100266: 1,
+    100267: 0,
+    100268: 1,
+    100269: 2,
+    100272: 1,
+    100273: 0,
+    100275: 1,
+    100276: 0,
+    100277: 2,
+    100278: 1,
+    100279: 0,
+    100303: 2,
+    100304: 1,
+    100305: 0,
+    100320: 0,
+    100321: 0,
+    100322: 0,
+    100323: 0,
+    100324: 0,
+    100325: 0,
+    100335: 0,
+    100341: 0,
+    100369: 2,
+    100370: 1,
+    100371: 0,
+    100372: 2,
+    100373: 1,
+    100377: 0,
+    100387: 0,
+    100389: 0,
+    100425: 2,
+    100428: 2,
+    100432: 1,
+    100450: 2,
+    100451: 1,
+    100452: 0,
+    100455: 2,
+    100460: 0,
+    100490: 0,
+    100527: 2,
+    100528: 0,
+    100529: 1,
+    100530: 2,
+    100549: 0,
+    100550: 1,
+    100551: 2,
+    100562: 0,
+    100588: 0,
+    100589: 1,
+    100590: 2,
+    100601: 0,
+    100602: 0,
+    100606: 0,
+    100607: 1,
+    100608: 2,
+    100609: 0,
+    100610: 1,
+    100611: 2,
+    100645: 0,
+    100648: 0,
+    100649: 1,
+}
+
+
+def _v173_character_accessory_slot(item_id):
+    return V173_CHARACTER_ACCESSORY_SLOTS.get(int(item_id))
+
+
+def _v173_repair_accessory_owners():
+    """Return accessories incorrectly mounted on backpacks/root to storage."""
+    invalid_owners = _v141_bag_gids() | {V110_BAG_MOUNT_OWNER}
+    changes = []
+    for prop in V111_INVENTORY:
+        if (_v173_character_accessory_slot(prop.get("item_id", 0)) is not None
+                and int(prop.get("owner_gid", 0)) in invalid_owners):
+            before = (int(prop["owner_gid"]), int(prop["location"]))
+            prop["owner_gid"], prop["location"] = 0, V109_LOC_BAG
+            changes.append((int(prop["gid"]), int(prop["item_id"]), before))
+    return changes
+
+
+def _v173_apply_accessory_equip(op):
+    if int(op.get("operation", -1)) != PROP_OP_EQUIP:
+        return None
+    subject = _v140_find_prop(int(op.get("subject_gid", 0)))
+    if subject is None:
+        return None
+    item_id = int(subject.get("item_id", 0))
+    slot = _v173_character_accessory_slot(item_id)
+    if slot is None:
+        return None
+
+    effective = dict(op)
+    roles = {
+        int(prop["gid"]): prop for prop in V111_INVENTORY
+        if _v140_role_slot(int(prop.get("item_id", 0))) is not None
+    }
+    requested = int(op.get("target_gid", 0))
+    owner = requested if requested in roles else int(_v140_current_role_gid())
+    if owner not in roles:
+        effective.update(target_gid=int(subject.get("owner_gid", 0)),
+                         location=int(subject.get("location", V109_LOC_BAG)))
+        return "v173 accessory equip ignored: no owned character root", effective
+
+    # Exclusivity is within this character, never across bag weapon sockets.
+    for other in V111_INVENTORY:
+        if (other is not subject and int(other.get("owner_gid", 0)) == owner
+                and int(other.get("location", V109_LOC_BAG)) == slot):
+            other["owner_gid"], other["location"] = 0, V109_LOC_BAG
+    subject["owner_gid"], subject["location"] = owner, slot
+    effective.update(target_gid=owner, location=slot)
+    return (f"v173 accessory equip item={item_id} character=0x{owner:016x} "
+            f"slot=0x{slot:02x}"), effective
 
 
 # v141 current-bag invariant:
@@ -4526,7 +5121,10 @@ def _v141_catalog_bag_item_ids():
         ]
         if not root_items and bundle_item_ids:
             root_items = [bundle_item_ids[0]]
-        bag_item_ids.update(root_items)
+        bag_item_ids.update(
+            item_id for item_id in root_items
+            if _v173_character_accessory_slot(item_id) is None
+        )
 
     return frozenset(bag_item_ids)
 
@@ -4642,7 +5240,7 @@ def _v140_prop_is_expired(prop, now=None):
 
 
 def _v140_expire_due_items(now=None, reason="item-expiration"):
-    """Remove expired Mall props and all props owned by their bundle roots."""
+    """Expire Mall props without deleting equipment stored inside backpacks."""
     now = int(time.time() if now is None else now)
     inventory = list(V111_INVENTORY)
     expired_gids = {
@@ -4654,8 +5252,32 @@ def _v140_expire_due_items(now=None, reason="item-expiration"):
     if not expired_gids:
         return []
 
-    # Bundled character parts and attachments are owned by their root and may
-    # not carry independent expiry timestamps.
+    expired_props = [
+        prop for prop in inventory
+        if int(prop.get("gid", 0)) in expired_gids
+    ]
+
+    # v159: owner_gid is both bundle ownership and equipment placement.
+    # Detach valid contents before removing an expired backpack.
+    expired_bag_gids = {
+        int(prop.get("gid", 0))
+        for prop in expired_props
+        if _v141_is_bag_item(int(prop.get("item_id", 0)))
+    }
+    detached_from_bags = []
+    if expired_bag_gids:
+        for prop in inventory:
+            gid = int(prop.get("gid", 0))
+            owner_gid = int(prop.get("owner_gid", 0))
+            if gid == 0 or gid in expired_gids:
+                continue
+            if owner_gid not in expired_bag_gids:
+                continue
+            old_loc = int(prop.get("location", V109_LOC_BAG))
+            prop["owner_gid"] = 0
+            prop["location"] = V109_LOC_BAG
+            detached_from_bags.append((gid, owner_gid, old_loc))
+
     removed_gids = set(expired_gids)
     while True:
         owned_gids = {
@@ -4669,10 +5291,6 @@ def _v140_expire_due_items(now=None, reason="item-expiration"):
             break
         removed_gids = expanded
 
-    expired_props = [
-        prop for prop in inventory
-        if int(prop.get("gid", 0)) in expired_gids
-    ]
     removed_props = [
         prop for prop in inventory
         if int(prop.get("gid", 0)) in removed_gids
@@ -4688,8 +5306,12 @@ def _v140_expire_due_items(now=None, reason="item-expiration"):
         prop for prop in inventory
         if int(prop.get("gid", 0)) not in removed_gids
     ]
+
     preferred_bag = V140_MALL_STATE.get("current_bag_gid")
-    _v141_set_current_bag(preferred_bag, reason=reason)
+    selected_bag, bag_changes = _v141_set_current_bag(
+        preferred_bag,
+        reason=reason,
+    )
     _v140_save_state(reason)
 
     expired_text = ",".join(
@@ -4697,28 +5319,181 @@ def _v140_expire_due_items(now=None, reason="item-expiration"):
     )
     log(
         "MALL-EXPIRY",
-        f"expired={len(expired_props)} removed={len(removed_props)} "
+        f"v159 expired={len(expired_props)} removed={len(removed_props)} "
         f"owned_removed={len(removed_props) - len(expired_props)} "
+        f"bag_contents_detached={len(detached_from_bags)} "
+        f"current_bag=0x{int(selected_bag):016x} "
+        f"bag_changes={len(bag_changes)} "
         f"now={now} gids=[{expired_text}]",
     )
+    if detached_from_bags:
+        log(
+            "MALL-BAG",
+            "v159 expired backpack preserved contents: "
+            + " | ".join(
+                f"gid=0x{gid:016x} from_bag=0x{bag_gid:016x} "
+                f"old_loc=0x{old_loc:02x} -> owner=0 loc=0x{V109_LOC_BAG:02x}"
+                for gid, bag_gid, old_loc in detached_from_bags
+            ),
+        )
     return removed_props
+
+
+def _v170_reconcile_progression_skills():
+    """Synchronize normal PVE skill ownership to persisted Experience.
+
+    Normal UnlockWay_1==1 skills are authoritative progression rewards:
+      * earned rows are present;
+      * unearned rows are absent.
+
+    Rank-127/event-condition skills are outside V170_PVE_LEVEL_SKILL_IDS and
+    are therefore completely untouched.
+    """
+    experience = max(0, int(V140_MALL_STATE.get("experience", 0)))
+
+    eligible_rows = [
+        (int(item_id), int(required_level), int(min_exp), str(name))
+        for item_id, required_level, min_exp, name in V170_PVE_LEVEL_SKILLS
+        if experience >= int(min_exp)
+    ]
+    eligible_ids = {row[0] for row in eligible_rows}
+
+    revoked = []
+    kept_inventory = []
+    for prop in list(V111_INVENTORY):
+        item_id = int(prop.get("item_id", 0))
+        if (
+            item_id in V170_PVE_LEVEL_SKILL_IDS
+            and item_id not in eligible_ids
+        ):
+            meta = next(
+                (
+                    row for row in V170_PVE_LEVEL_SKILLS
+                    if int(row[0]) == item_id
+                ),
+                None,
+            )
+            if meta is not None:
+                revoked.append(
+                    (
+                        int(prop.get("gid", 0)),
+                        item_id,
+                        int(meta[1]),
+                        int(meta[2]),
+                        str(meta[3]),
+                    )
+                )
+            continue
+        kept_inventory.append(prop)
+
+    if revoked:
+        V111_INVENTORY[:] = kept_inventory
+
+    owned_item_ids = {
+        int(prop.get("item_id", 0)) for prop in V111_INVENTORY
+    }
+    missing = [
+        row for row in eligible_rows if row[0] not in owned_item_ids
+    ]
+
+    used_gids = {int(prop.get("gid", 0)) for prop in V111_INVENTORY}
+    granted = []
+    for item_id, required_level, min_exp, name in missing:
+        gid = _v140_next_gid(used_gids)
+        used_gids.add(gid)
+        V111_INVENTORY.append(
+            {
+                "gid": gid,
+                "item_id": item_id,
+                "owner_gid": 0,
+                "location": V109_LOC_BAG,
+                "durability": 0,
+                "durability_max": 0,
+                "avail_hours": V140_ITEM_AVAIL_HOURS,
+                "validity": V140_ITEM_AVAIL_HOURS,
+                "gain_type": 1,
+                "obtained_at": 0,
+                "expires_at": 0,
+            }
+        )
+        granted.append((gid, item_id, required_level, min_exp, name))
+        owned_item_ids.add(item_id)
+
+    if granted or revoked:
+        V140_MALL_STATE["inventory"] = [dict(p) for p in V111_INVENTORY]
+
+    return {
+        "experience": experience,
+        "eligible_ids": eligible_ids,
+        "granted": granted,
+        "revoked": revoked,
+    }
 
 
 def _v140_select_player(uin):
     uin = _V140_PLAYER_STATE.select(int(uin))
     _v140_expire_due_items(reason="sqlite-player-select-expiry")
+
+    skill_sync = _v170_reconcile_progression_skills()
+    skill_grants = list(skill_sync["granted"])
+    skill_revokes = list(skill_sync["revoked"])
+    skill_changed = bool(skill_grants or skill_revokes)
+
     preferred = V140_MALL_STATE.get("current_bag_gid")
     selected_gid, changes = _v141_set_current_bag(
         preferred,
         reason="sqlite-player-select",
     )
+    if changes or skill_changed:
+        save_reason = (
+            "sqlite-player-select-skill-reconcile"
+            if skill_changed
+            else "sqlite-bag-invariant-repair"
+        )
+        _v140_save_state(save_reason)
+
     if changes:
-        _v140_save_state("sqlite-bag-invariant-repair")
         log(
             "MALL-SQLITE",
             f"v4 repaired bag-root state uin={uin} "
             f"current_bag=0x{selected_gid:016x} changes={changes}",
         )
+
+    if skill_changed:
+        log(
+            "PVE-SKILL",
+            "PVE-SKILL-PROGRESSION-v2 reconciled "
+            f"uin={uin} exp={int(skill_sync['experience'])} "
+            f"granted={len(skill_grants)} revoked={len(skill_revokes)}",
+        )
+        if skill_grants:
+            log(
+                "PVE-SKILL",
+                "v2 granted: "
+                + " | ".join(
+                    f"{name}(item={item_id},level={required_level},"
+                    f"gid=0x{gid:016x})"
+                    for gid, item_id, required_level, _min_exp, name
+                    in skill_grants
+                ),
+            )
+        if skill_revokes:
+            log(
+                "PVE-SKILL",
+                "v2 revoked-above-level: "
+                + " | ".join(
+                    f"{name}(item={item_id},level={required_level},"
+                    f"gid=0x{gid:016x})"
+                    for gid, item_id, required_level, _min_exp, name
+                    in skill_revokes
+                ),
+            )
+
+    accessory_repairs = _v173_repair_accessory_owners()
+    if accessory_repairs:
+        _v140_save_state("character-accessory-owner-repair-v173")
+        log("MALL", f"v173 returned misplaced accessories to storage uin={uin} changes={accessory_repairs}")
+
     return _V140_PLAYER_STATE.state()
 
 
@@ -5192,11 +5967,16 @@ def _v140_plan_purchase(req, self_uin=V109_UIN):
     if int(req.get("count", 0)) <= 0 or not req.get("commodities"):
         raise _v140_ShopReject(SHOP_ERR_SHOPCART_EMPTY, "empty cart")
 
-    if int(req.get("buy_type", 0)) != 1:
-        raise _v140_ShopReject(
-            SHOP_ERR_FAIL,
-            f"only normal self-buy is implemented; buy_type={req.get('buy_type')}",
-        )
+    # v164: BuyType is opaque stock-client purchase-mode metadata.
+    #
+    # Do not whitelist BuyType values or tie purchase handling to particular
+    # commodities/weapons. Direct purchases, recommended-item multi-buy, and
+    # shopping-cart purchases all use the same generic atomic planner.
+    #
+    # Authorization is based on Consignne below. Every commodity row is still
+    # validated server-side for ID, price index/period, currency, voucher,
+    # ConvertMP and wallet balance before anything is committed.
+    buy_type = int(req.get("buy_type", 0)) & 0xFFFF
 
     self_uin = int(self_uin) & 0xFFFFFFFF
     consignne = int(req.get("consignne") or self_uin)
@@ -5339,8 +6119,8 @@ def _v140_build_update_player_property(update_flag, reason):
         else 0
     )
     body = (
-        _v48_u16(update_flag)
-        + _v48_u32(reason)
+        _v48_u32(update_flag)
+        + _v48_u16(reason)
         + _v48_i32(int(wallet["ap"]))
         + _v48_i32(0)                 # HappyPoint
         + _v48_i32(int(wallet["gp"]))
@@ -5351,12 +6131,215 @@ def _v140_build_update_player_property(update_flag, reason):
         + _v48_u16(0)                 # UpdateProp count
     )
     if len(body) != 36:
-        raise AssertionError(f"A00B wallet body len={len(body)}")
+        raise AssertionError(f"A00A UpdatePlayerProperty body len={len(body)}")
     return _v62_build_server_app(
         TGAME_ZN_MAGIC,
         TGAME_ZN_NTF_UPDATE_PLAYER_PROPERTY,
         body,
     )
+
+
+def _v140_build_authoritative_wallet_refresh():
+    """Build read-only AP/GP/MP refresh notifications from the current wallet."""
+    specs = (
+        (UPDATE_FLAG_TP, "AP", UPDATE_REASON_TP_BALANCE),
+        (UPDATE_FLAG_GP, "GP", 0),
+        (UPDATE_FLAG_MP, "MP", 0),
+    )
+    return tuple(
+        (
+            flag,
+            name,
+            reason,
+            _v140_build_update_player_property(flag, reason),
+        )
+        for flag, name, reason in specs
+    )
+
+
+V140_MONEYFLOW_REPLAY_LIMIT = 360
+
+
+def _v140_moneyflow_datetime_now(epoch=None):
+    """Serialize one PH/TDR datetime scalar for Consumer List rows.
+
+    TDR type 0x17 is an 8-byte scalar. Build the native x86 structure first,
+    then byte-swap the whole scalar for the wire.
+    """
+    tm = time.localtime(
+        time.time() if epoch is None else int(epoch)
+    )
+    host = struct.pack(
+        "<hBBhBB",
+        int(tm.tm_year),
+        int(tm.tm_mon),
+        int(tm.tm_mday),
+        int(tm.tm_hour),
+        int(tm.tm_min),
+        int(tm.tm_sec),
+    )
+    raw = host[::-1]
+    if len(raw) != 8:
+        raise AssertionError(
+            f"money-flow datetime wire size {len(raw)} != 8"
+        )
+    return raw
+
+
+def _v140_pack_moneyflow_record(
+    uin,
+    money_type,
+    number,
+    current,
+    *,
+    reason=MONEYREASON_BUY,
+    when=None,
+):
+    """Build one stock PH PlayerMoneyFlow record (26 bytes)."""
+    dt = bytes(when) if when is not None else _v140_moneyflow_datetime_now()
+    if len(dt) != 8:
+        raise ValueError(f"money-flow datetime must be 8B, got {len(dt)}")
+    raw = (
+        _v48_u64(int(uin))
+        + dt
+        + _v48_u8(int(money_type))
+        + _v48_i32(int(number))
+        + _v48_i32(int(current))
+        + _v48_u8(int(reason))
+    )
+    if len(raw) != 26:
+        raise AssertionError(f"PlayerMoneyFlow wire size {len(raw)} != 26")
+    return raw
+
+
+def _v140_build_moneyflow_notification(records):
+    """Build verified ZN2C_NtfMoneyFlow (0xA367)."""
+    records = [bytes(row) for row in records]
+    if len(records) > 90:
+        raise ValueError("too many money-flow rows")
+    for row in records:
+        if len(row) != 26:
+            raise ValueError(f"bad PlayerMoneyFlow row size={len(row)}")
+    body = _v48_u32(len(records)) + b"".join(records)
+    return _v62_build_server_app(
+        TGAME_ZN_MAGIC,
+        TGAME_ZN_NTF_MONEYFLOW,
+        body,
+    )
+
+
+def _v140_make_purchase_moneyflow_rows(
+    *,
+    session_uin,
+    consume_tp,
+    consume_gp,
+    consume_mp,
+    occurred_at=None,
+    details="",
+    commodity_ids=(),
+):
+    """Create DB/wire rows from the authoritative post-purchase wallet."""
+    occurred_at = int(
+        time.time() if occurred_at is None else occurred_at
+    )
+    wallet = _v140_wallet()
+    details = str(details or "")
+    commodity_ids = [int(value) for value in commodity_ids]
+    rows = []
+
+    for money_type, amount, current in (
+        (MONEYTYPE_TP, int(consume_tp), int(wallet["ap"])),
+        (MONEYTYPE_GP, int(consume_gp), int(wallet["gp"])),
+        (MONEYTYPE_MP, int(consume_mp), int(wallet["mp"])),
+    ):
+        if amount <= 0:
+            continue
+        rows.append(
+            {
+                "uin": int(session_uin),
+                "occurred_at": occurred_at,
+                "money_type": int(money_type),
+                "number": -amount,
+                "current": current,
+                "reason": MONEYREASON_BUY,
+                "details": details,
+                "commodity_ids": list(commodity_ids),
+            }
+        )
+    return rows
+
+
+def _v140_send_moneyflow_rows(
+    conn,
+    key,
+    label,
+    rows,
+    *,
+    source,
+):
+    """Send persisted/live money-flow rows in the stock maximum of 90/packet."""
+    rows = [dict(row) for row in rows]
+    if not rows:
+        return 0
+
+    sent = 0
+    chunks = [rows[i:i + 90] for i in range(0, len(rows), 90)]
+    for chunk_index, chunk in enumerate(chunks):
+        records = [
+            _v140_pack_moneyflow_record(
+                int(row.get("uin", _V140_PLAYER_STATE.current_uin())),
+                int(row["money_type"]),
+                int(row["number"]),
+                int(row["current"]),
+                reason=int(row.get("reason", MONEYREASON_BUY)),
+                when=_v140_moneyflow_datetime_now(
+                    int(row.get("occurred_at", time.time()))
+                ),
+            )
+            for row in chunk
+        ]
+        pkt = _v140_build_moneyflow_notification(records)
+        summary = ",".join(
+            f"{int(row['money_type'])}:{int(row['number'])}"
+            f"->{int(row['current'])}"
+            for row in chunk
+        )
+        _v48_send_app(
+            conn,
+            key,
+            pkt,
+            label,
+            "ZN2C_NTF_MONEYFLOW "
+            "CONSUMER-LIST-A367-PERSIST-v1 "
+            f"source={source} "
+            f"chunk={chunk_index + 1}/{len(chunks)} "
+            f"count={len(chunk)} rows={summary}",
+        )
+        sent += len(chunk)
+    return sent
+
+
+def _v140_replay_moneyflow(conn, key, label, *, session_uin):
+    """Replay persisted Consumer List history after the stock profile is ready."""
+    rows = PLAYER_DB.load_moneyflow(
+        int(session_uin),
+        limit=V140_MONEYFLOW_REPLAY_LIMIT,
+    )
+    for row in rows:
+        row["uin"] = int(session_uin)
+    sent = _v140_send_moneyflow_rows(
+        conn,
+        key,
+        label,
+        rows,
+        source="sqlite-login-replay",
+    )
+    log(
+        "MALL-SQLITE",
+        f"Consumer List replay uin={int(session_uin)} "
+        f"rows={sent} limit={V140_MONEYFLOW_REPLAY_LIMIT}",
+    )
+    return sent
 
 
 def _v140_send_wallet_sync(conn, key, label, reason=UPDATE_REASON_BUY, prefix="mall"):
@@ -5450,6 +6433,106 @@ def _v140_build_item_operation_response(op_body):
 
 
 
+
+# v160 Item-tab support.
+V160_RENAME_CARD_ITEM_ID = 100181
+V160_CLEAR_RECORD_CARD_ITEM_ID = 100182
+V160_CLEAR_WINLOSE_CARD_ITEM_ID = 100196
+V160_REGULAR_EXP_CARD_ITEM_ID = 100059
+V160_ADVANCED_EXP_CARD_ITEM_ID = 100060
+
+
+def _v160_build_result_only_response(command_id, result=ZONE_ERR_SUCC):
+    return _v62_build_server_app(
+        TGAME_ZN_MAGIC,
+        int(command_id) & 0xFFFF,
+        _v48_u16(int(result) & 0xFFFF),
+    )
+
+
+def _v160_parse_use_card(body):
+    if len(body) != 8:
+        raise ValueError(f"A347 UseCard body must be exactly 8B, got {len(body)}")
+    func_type, sub_func_type = struct.unpack(">ii", body)
+    return int(func_type), int(sub_func_type)
+
+
+def _v160_find_inventory_item(item_id):
+    item_id = int(item_id)
+    candidates = [
+        p for p in V111_INVENTORY
+        if int(p.get("item_id", 0)) == item_id
+        and not _v140_prop_is_expired(p)
+    ]
+    if not candidates:
+        return None
+
+    def _sort_key(prop):
+        exp = int(prop.get("expires_at", 0) or 0)
+        return (
+            exp <= 0,
+            exp if exp > 0 else 0x7FFFFFFFFFFFFFFF,
+            int(prop["gid"]),
+        )
+
+    return min(candidates, key=_sort_key)
+
+
+def _v160_consume_inventory_item(item_id, reason):
+    prop = _v160_find_inventory_item(item_id)
+    if prop is None:
+        return None
+
+    gid = int(prop["gid"])
+    removed = {gid}
+    while True:
+        children = {
+            int(p.get("gid", 0))
+            for p in V111_INVENTORY
+            if int(p.get("owner_gid", 0)) in removed
+            and int(p.get("gid", 0)) != 0
+        }
+        expanded = removed | children
+        if expanded == removed:
+            break
+        removed = expanded
+
+    V111_INVENTORY[:] = [
+        p for p in V111_INVENTORY
+        if int(p.get("gid", 0)) not in removed
+    ]
+    _v140_save_state(reason)
+    return prop
+
+
+def _v160_activate_known_function_card(func_type, sub_func_type):
+    if int(func_type) != 0:
+        return None, "unsupported FunctionType"
+
+    item_id = {
+        0: V160_REGULAR_EXP_CARD_ITEM_ID,
+        1: V160_ADVANCED_EXP_CARD_ITEM_ID,
+    }.get(int(sub_func_type))
+    if item_id is None:
+        return None, "unsupported ExpAcceleration SubFunctionType"
+
+    prop = _v160_find_inventory_item(item_id)
+    if prop is None:
+        return None, f"required item {item_id} is not owned"
+
+    default_loc = int(V140_ITEM_DEFAULT_LOCATIONS.get(item_id, -1))
+    if default_loc < 0 or default_loc > 0xFF:
+        return None, f"item {item_id} has no usable catalog slot"
+
+    prop["owner_gid"] = V110_BAG_MOUNT_OWNER
+    prop["location"] = default_loc & 0xFF
+    _v140_save_state("A347-use-function-card")
+    return prop, (
+        f"activated item={item_id} gid=0x{int(prop['gid']):016x} "
+        f"slot=0x{default_loc:02x}"
+    )
+
+
 def _v109_build_starter_playerprops(seq):
     """Compatibility helper: only valid when inventory fits one A006."""
     if len(V111_INVENTORY) > 5:
@@ -5507,14 +6590,11 @@ def _v111_build_prop_operation_notification(op_body):
 
 
 def _v143b_resolve_null_subject_unequip(op):
-    """Resolve stock-PH null-subject remove requests into a real equipped GID.
+    """Resolve stock-PH null-subject Remove/Unequip into a real equipped GID.
 
-    Observed stock PH melee remove form:
-        op=0, subject=0, target=<current bag gid>, location=0
-
-    MK4/Jungle Bolo is item 100058 / canonical melee location 0x02.
-    Translate only this exact loc=0 quirk to a canonical takeoff, so a null
-    request can never arbitrarily remove the primary weapon.
+    Live PH melee Remove arrives as op=0, subject=0, target=<bag>, location=0.
+    v161 is catalog-driven instead of hard-coding MK4/Jungle Bolo (100058),
+    and also recovers purchased melee rows left at legacy Location=Bag.
     """
     if int(op.get("operation", -1)) != PROP_OP_EQUIP:
         return None
@@ -5523,54 +6603,75 @@ def _v143b_resolve_null_subject_unequip(op):
 
     target_bag = int(op.get("target_gid", 0))
     req_loc = int(op.get("location", V109_LOC_BAG))
-
     if target_bag not in _v141_bag_gids():
         return None
 
-    # Exact live retail quirk: melee Remove can arrive as loc=0 even though
-    # the equipped PropInfo location is 0x02.
-    if req_loc == V109_LOC_PRIMARY:
-        melee = next(
-            (
-                p for p in V111_INVENTORY
-                if int(p.get("item_id", 0)) == V127_MELEE_ITEM_ID
-                and int(p.get("owner_gid", 0)) == target_bag
-                and int(p.get("location", V109_LOC_BAG)) == V127_LOC_MELEE
-            ),
-            None,
-        )
-        if melee is not None:
-            effective = {
-                "operation": PROP_OP_TAKEOFF,
-                "subject_gid": int(melee["gid"]),
-                "target_gid": 0,
-                "location": V109_LOC_BAG,
-            }
-            return melee, effective, (
-                "v143b null-subject melee remove -> canonical takeoff "
-                f"gid=0x{int(melee['gid']):016x} "
-                f"item={int(melee.get('item_id', 0))}"
+    def _catalog_slot(prop):
+        try:
+            return int(
+                V140_ITEM_DEFAULT_LOCATIONS.get(
+                    int(prop.get("item_id", 0)), -1
+                )
             )
+        except Exception:
+            return -1
 
-    # Generic safe form for explicit non-zero equipment locations.
-    if req_loc in (V127_LOC_PISTOL, V127_LOC_MELEE, V127_LOC_GRENADE):
-        matches = [
+    def _pick_catalog_slot(slot, allow_legacy_bag=False):
+        exact = [
             p for p in V111_INVENTORY
             if int(p.get("owner_gid", 0)) == target_bag
-            and int(p.get("location", V109_LOC_BAG)) == req_loc
-            and int(p.get("item_id", 0)) in V127_STARTER_WEAPON_SLOTS
+            and int(p.get("location", V109_LOC_BAG)) == int(slot)
+            and _catalog_slot(p) == int(slot)
         ]
-        if len(matches) == 1:
-            item = matches[0]
-            effective = {
-                "operation": PROP_OP_TAKEOFF,
-                "subject_gid": int(item["gid"]),
-                "target_gid": 0,
-                "location": V109_LOC_BAG,
-            }
-            return item, effective, (
-                "v143b null-subject slot remove -> canonical takeoff "
-                f"gid=0x{int(item['gid']):016x} slot=0x{req_loc:02x}"
+        if exact:
+            exact.sort(key=lambda p: int(p.get("gid", 0)))
+            return exact[0], "canonical"
+
+        if allow_legacy_bag:
+            legacy = [
+                p for p in V111_INVENTORY
+                if int(p.get("owner_gid", 0)) == target_bag
+                and int(p.get("location", V109_LOC_BAG)) == V109_LOC_BAG
+                and _catalog_slot(p) == int(slot)
+            ]
+            if legacy:
+                legacy.sort(key=lambda p: int(p.get("gid", 0)))
+                return legacy[0], f"legacy-bag candidates={len(legacy)}"
+
+        return None, None
+
+    def _canonical_takeoff(item, slot, source, kind):
+        effective = {
+            "operation": PROP_OP_TAKEOFF,
+            "subject_gid": int(item["gid"]),
+            "target_gid": 0,
+            "location": V109_LOC_BAG,
+        }
+        return item, effective, (
+            f"v161 null-subject {kind} remove -> canonical takeoff "
+            f"gid=0x{int(item['gid']):016x} "
+            f"item={int(item.get('item_id', 0))} "
+            f"catalog_slot=0x{int(slot):02x} source={source}"
+        )
+
+    if req_loc == V109_LOC_PRIMARY:
+        melee, source = _pick_catalog_slot(
+            V127_LOC_MELEE,
+            allow_legacy_bag=True,
+        )
+        if melee is not None:
+            return _canonical_takeoff(
+                melee, V127_LOC_MELEE, source, "melee"
+            )
+
+    if req_loc in (V127_LOC_PISTOL, V127_LOC_MELEE, V127_LOC_GRENADE):
+        item, source = _pick_catalog_slot(
+            req_loc,
+            allow_legacy_bag=True,
+        )
+        if item is not None:
+            return _canonical_takeoff(
+                item, req_loc, source, "slot"
             )
 
     return None
@@ -5586,6 +6687,10 @@ def _v111_apply_prop_operation(op):
     canonical equipment slot is Primary (0). If the client asks to equip that
     weapon to a bag using generic Location=Bag, normalize it to Primary.
     """
+    accessory = _v173_apply_accessory_equip(op)
+    if accessory is not None:
+        return accessory
+
     eff = dict(op)
     gid = int(op["subject_gid"])
     subject = next((p for p in V111_INVENTORY if int(p["gid"]) == gid), None)
@@ -5719,7 +6824,23 @@ def _v111_apply_prop_operation(op):
         if canonical_slot is not None and location == V109_LOC_BAG:
             location = canonical_slot
 
-        # Real equipment sockets are exclusive inside one bag.
+        # v160: Item-tab props use catalog-defined sockets. Canonicalize only
+        # a generic Location=Bag request; explicit client locations remain.
+        catalog_slot = int(V140_ITEM_DEFAULT_LOCATIONS.get(item_id, -1))
+        if (
+            location == V109_LOC_BAG
+            and not _v140_is_role_item(item_id)
+            and not _v141_is_bag_item(item_id)
+            and 0 <= catalog_slot <= 0xFF
+            and catalog_slot not in (
+                V109_LOC_ROLE1,
+                0x0B,
+                V109_LOC_BAG,
+            )
+        ):
+            location = catalog_slot
+
+        # Real equipment sockets are exclusive inside one bag/root.
         if location != V109_LOC_BAG:
             for other in V111_INVENTORY:
                 if other is subject:
@@ -5772,13 +6893,14 @@ def _v124_build_bag1_refresh_notification():
         _v111_pack_prop_operation(op)
     )
 
-def _v48_player_info(uin=10001, nickname="LocalPlayer", cur_role_gid=None):
+def _v48_player_info(uin=10001, nickname="LocalPlayer", cur_role_gid=None, player_state=None):
     # Exact field order recovered from PlayerInfo metalib. v70 uses the runtime-verified\n    # TDR string form for NickName: u32_be(strlen+1) + NUL-terminated bytes.\n    # CurRoleGID/RoleType
     # v140 resolves the active role and wallet from persistent mall state when omitted.
     if cur_role_gid is None:
-        cur_role_gid = _v140_current_role_gid()
-    wallet = _v140_wallet()
-    experience = int(V140_MALL_STATE.get("experience", 0))
+        cur_role_gid = _v140_current_role_gid() if player_state is None else _r13_wire_gid(player_state["current_role_gid"], uin)
+    wallet = _v140_wallet() if player_state is None else player_state["wallet"]
+    experience = int((V140_MALL_STATE if player_state is None else player_state).get("experience", 0))
+    clan = CLAN_DB.get_player_clan(uin)
     return (
         _v48_u64(uin)
         + _v48_u32(0)
@@ -5790,7 +6912,7 @@ def _v48_player_info(uin=10001, nickname="LocalPlayer", cur_role_gid=None):
         + _v48_dt_zero() + _v48_dt_zero()
         + _v48_u64(cur_role_gid)  # CurRoleGID (v109 real role prop)
         + _v48_u64(0)             # RoleType
-        + _v48_u64(0)
+        + _v48_u64(clan["clan_id"] if clan else 0)  # ClanID
         + _v48_u32(0) + _v48_u32(0) + _v48_u32(0) + _v48_u32(0)
         + _v48_u16(0)
         + _v48_dt_zero() + _v48_dt_zero()
@@ -5823,6 +6945,46 @@ def _v48_build_playerinfo(seq, uin=10001, cur_role_gid=None, nickname="LocalPlay
     )
     body = _v48_u16(ZONE_ERR_SUCC) + info
     return _v62_build_server_app(TGAME_ZN_MAGIC, TGAME_ZN_NTF_PLAYERINFO, body)
+
+
+def _clan_debug_hex(plain):
+    # Redact credentials even for truncated application payloads. C2ZN has
+    # its client sequence at +0, magic at +4, and command at +6.
+    if len(plain) >= 8 and plain[4:6] == b'\x32\x43':
+        cmd = struct.unpack_from('>H', plain, 6)[0]
+        if cmd in CLAN_SENSITIVE_COMMANDS:
+            return '<clan credentials redacted>'
+    return plain.hex()
+
+
+def _clan_dispatch(conn, key, app, session_uin, label):
+    replies, affected = CLAN_SERVICE.handle(app['cmd'], app['body'], int(session_uin or 0))
+    # Badge purchases debit SQLite directly, atomically with the grant. Refresh
+    # the mall working set before any later inventory save can restore old funds.
+    if app['cmd'] in (0xB04A, 0xB025) and int(session_uin or 0) in affected:
+        _V140_PLAYER_STATE.reload(int(session_uin))
+        if app['cmd'] == 0xB025:
+            _v140_send_wallet_sync(conn, key, label, reason=0, prefix='clan expansion')
+    for cmd, body in replies:
+        _v48_send_app(conn, key, _v62_build_server_app(TGAME_ZN_MAGIC, cmd, body), label,
+                      f'CLAN response cmd=0x{cmd:04X} uin={session_uin}')
+    log('CLAN', f'cmd=0x{app["cmd"]:04X} uin={session_uin} replies={len(replies)} changed={sorted(affected)}')
+    for uin in sorted(affected):
+        session = _v150_session_snapshot(uin)
+        if not session:
+            continue
+        state = PLAYER_DB.load_player_state(uin)
+        info = _v48_player_info(uin=uin, nickname=PLAYER_DB.load_nickname(uin) or '', player_state=state)
+        profile = _v62_build_server_app(TGAME_ZN_MAGIC, TGAME_ZN_NTF_PLAYERINFO, _v48_u16(ZONE_ERR_SUCC) + info)
+        _v150_send_online(uin, profile, f'CLAN membership profile uin={uin}')
+        if CLAN_DB.get_player_clan(uin):
+            for update_cmd, update_body in CLAN_SERVICE.refresh_replies(uin):
+                packet = _v62_build_server_app(TGAME_ZN_MAGIC, update_cmd, update_body)
+                _v150_send_online(uin, packet, f'CLAN menu refresh cmd=0x{update_cmd:04X}')
+        elif app['cmd'] == 0xB039:
+            for update_cmd, update_body in CLAN_SERVICE.disband_replies(uin):
+                packet = _v62_build_server_app(TGAME_ZN_MAGIC, update_cmd, update_body)
+                _v150_send_online(uin, packet, f'CLAN disband refresh cmd=0x{update_cmd:04X}')
 
 
 def _v48_build_empty_playerprops(seq):
@@ -7585,6 +8747,48 @@ def _v48_send_app(conn, key, app_plain, label, desc, *, tpdu_cmd=0):
         f"enc_len={len(enc)} wire={_short_hex(pkt, 160)}"
     )
     return pkt
+
+
+def tgame_build_cmd04_ident(key, mode, ident_plain):
+    """Build TPDU_CMD_IDENT (cmd04) for a resumed TGame connection.
+
+    TQQAPI v14 layout:
+      TPDUBase(12) || u32 EncryptIdentLen || EncryptIdent
+
+    EncryptIdent decrypts to TPDUIdentInfo:
+      u32 Pos || char Ident[16]
+
+    On reconnect we replay the exact validated 20-byte TPDUIdentInfo that the
+    client presented inside cmd06, rather than inventing a new identity.
+    """
+    ident_plain = bytes(ident_plain or b"")
+    if len(ident_plain) != 20:
+        raise ValueError(
+            f"TPDUIdentInfo must be exactly 20 bytes, got {len(ident_plain)}"
+        )
+    if mode == 3:
+        enc = tgame_mode3_encrypt(ident_plain, key)
+    elif mode == 4:
+        enc = tgame_mode4_encrypt(ident_plain, key)
+    else:
+        raise ValueError(f"unsupported IDENT encryption mode {mode}")
+    if len(enc) > 0xFFFFFFFF:
+        raise ValueError("encrypted IDENT too large")
+    total = 16 + len(enc)
+    pkt = (
+        b"\x55\x0e\x04\x00"
+        + struct.pack(">I", total)
+        + bytes(4)
+        + struct.pack(">I", len(enc))
+        + enc
+    )
+    if len(pkt) != total:
+        raise AssertionError(
+            f"cmd04 IDENT frame length mismatch: total={total} actual={len(pkt)}"
+        )
+    return pkt, enc
+
+
 def tgame_build_cmd01_chgskey(old_key, mode, new_key=b"LOCAL_GAME_KEY01"):
     """Build the post-SYN key-change packet expected after cmd09.
 
@@ -8318,6 +9522,32 @@ def handle_placeholder(conn, addr, label):
                     "uin": int(tgame_auth.get("uin") or 10001),
                 }
                 _v140_select_player(role_state["uin"])
+
+                # v159: stock PH visually initializes a fresh lobby on Bag 1.
+                # Align a genuinely fresh TGame auth with that client state.
+                # The separate persistent-resume path remains unchanged.
+                _v159_before_bag = _v141_current_bag_gid()
+                _v159_startup_bag, _v159_startup_changes = (
+                    _v141_set_current_bag(
+                        V109_BAG1_GID,
+                        reason="v159-fresh-session-default",
+                    )
+                )
+                if (
+                    int(_v159_startup_bag) != int(_v159_before_bag)
+                    or _v159_startup_changes
+                ):
+                    _v140_save_state("v159-fresh-session-default")
+                role_state["v159_startup_bag_gid"] = int(_v159_startup_bag)
+                log(
+                    "MALL-BAG",
+                    "v159 fresh-session bag aligned with stock lobby "
+                    f"before=0x{int(_v159_before_bag):016x} "
+                    f"selected=0x{int(_v159_startup_bag):016x} "
+                    f"changes={len(_v159_startup_changes)}; "
+                    "persistent-resume path intentionally unchanged",
+                )
+
                 _persist_login, _persist_nick = _r12_load_persisted_nickname(
                     role_state["uin"]
                 )
@@ -8355,6 +9585,13 @@ def handle_placeholder(conn, addr, label):
                             f"{type(_resume_error).__name__}",
                         )
                     _resume_matches = []
+                    if len(_resume_candidates) > 1:
+                        log(
+                            label,
+                            "Persistent TGame multi-session lookup "
+                            f"ip={addr[0]} candidates={len(_resume_candidates)}; "
+                            "authenticating cmd06 against every candidate key/UIN",
+                        )
                     for _candidate in _resume_candidates:
                         _candidate_key = _candidate.get("transport_key")
                         if _candidate_key is None:
@@ -8365,6 +9602,29 @@ def handle_placeholder(conn, addr, label):
                                 bytes(_candidate_key),
                                 tgame_mode3_decrypt,
                             )
+                            # PH v14 cmd06 is NOT laid out like the older
+                            # TPDUExtRelay XML at wire offsets 12..28. The
+                            # verified parser proves those fields are:
+                            #   EncMethod, ServiceID, reserved, EncHeadLen
+                            # and the encrypted header plaintext starts with
+                            # UIN. Live-compatible framing is:
+                            #   UIN(u32) || TPDUIdentInfo(20 bytes)
+                            # where TPDUIdentInfo = Pos(u32) || Ident[16].
+                            # Reuse that exact decrypted identity for cmd04.
+                            _relay_head_len = struct.unpack(">I", data[4:8])[0]
+                            _relay_header_plain = tgame_mode3_decrypt(
+                                data[28:_relay_head_len], bytes(_candidate_key)
+                            )
+                            if len(_relay_header_plain) < 24:
+                                raise ValueError(
+                                    "cmd06 decrypted header too short for UIN+TPDUIdentInfo"
+                                )
+                            _relay_ident_plain = bytes(_relay_header_plain[4:24])
+                            _cmd06["ident_plain"] = _relay_ident_plain
+                            _cmd06["ident_pos"] = struct.unpack(
+                                ">I", _relay_ident_plain[:4]
+                            )[0]
+                            _cmd06["header_plain_len"] = len(_relay_header_plain)
                         except Exception:
                             continue
                         if _cmd06["uin"] == int(_candidate["uin"]):
@@ -8375,8 +9635,9 @@ def handle_placeholder(conn, addr, label):
                         for candidate, _request in _resume_matches
                     }
                     if len(_resume_uins) == 1:
-                        # Repeated logins may leave several sessions for the
-                        # same account; use the most recently active one.
+                        # Multi-user hosted mode: many UINs may coexist. Repeated logins
+                        # for the SAME account may leave several durable tickets;
+                        # use that account's most recently active matching ticket.
                         _resume, _cmd06 = max(
                             _resume_matches,
                             key=lambda match: float(match[0]["last_seen_at"]),
@@ -8404,6 +9665,16 @@ def handle_placeholder(conn, addr, label):
                             "tgame": True,
                             "uin": tgame_session_uin,
                             "persistent_resume": True,
+                            # cmd06 is the client's transport continuity marker.
+                            # Keep it so the post-SYNACK resume path can derive
+                            # the same diagnostic sequence window as normal A000.
+                            "persistent_resume_client_seq": int(_cmd06["sequence"]),
+                            "persistent_resume_service_id": int(_cmd06.get("service_id", 0)),
+                            "persistent_resume_header_plain_len": int(_cmd06.get("header_plain_len", 0)),
+                            "persistent_resume_ident_pos": int(_cmd06.get("ident_pos", 0)),
+                            "persistent_resume_ident_plain": bytes(
+                                _cmd06.get("ident_plain") or b""
+                            ),
                         }
                         _v140_select_player(tgame_session_uin)
                         _persist_login, _persist_nick = (
@@ -8455,6 +9726,9 @@ def handle_placeholder(conn, addr, label):
                             "Persistent TGame cmd06 authenticated "
                             f"uin={tgame_session_uin} "
                             f"client_seq=0x{_cmd06['sequence']:08x} "
+                            f"service_id={int(_cmd06.get('service_id', 0))} "
+                            f"header_plain_len={int(_cmd06.get('header_plain_len', 0))} "
+                            f"ident_pos=0x{int(_cmd06.get('ident_pos', 0)):08x} "
                             f"expires_in={_resume_remaining}s",
                         )
                         syn, syn_cipher = tgame_build_cmd08_syn_auto(
@@ -8638,10 +9912,43 @@ def handle_placeholder(conn, addr, label):
                                 log(
                                     label,
                                     f"TGame mode3 follow-up cmd=0x{cmd_now:02x} "
-                                    f"total={total_now} plain={plain_now.hex()}"
+                                    f"total={total_now} plain={_clan_debug_hex(plain_now)}"
                                 )
                                 if plain_now == TGAME_SYN_RAND:
                                     log(label, "TGame SYNACK verified: challenge echo matches")
+
+                                    # TPDU relay/reconnect completion: the stock
+                                    # TQQAPI state machine sends IDENT (cmd04)
+                                    # before CHGSKEY after SYNACK. Fresh AF login
+                                    # happens to tolerate our old CHGSKEY-only path,
+                                    # but a cmd06 RELAY remains in reconnect state
+                                    # without the connection-established IDENT.
+                                    if (
+                                        role_state.get("persistent_resume")
+                                        and label.upper() == "ZONE"
+                                    ):
+                                        _resume_ident_plain = bytes(
+                                            role_state.get(
+                                                "persistent_resume_ident_plain"
+                                            ) or b""
+                                        )
+                                        ident_pkt, ident_enc = tgame_build_cmd04_ident(
+                                            active_tgame_key,
+                                            mode_now,
+                                            _resume_ident_plain,
+                                        )
+                                        conn.sendall(ident_pkt)
+                                        log(
+                                            label,
+                                            "TX TGAME cmd04 IDENT for persistent resume "
+                                            f"({len(ident_pkt)}B) "
+                                            f"service_id={int(role_state.get('persistent_resume_service_id', 0))} "
+                                            f"header_plain_len={int(role_state.get('persistent_resume_header_plain_len', 0))} "
+                                            f"ident_pos=0x{int(role_state.get('persistent_resume_ident_pos', 0)):08x} "
+                                            f"enc_len={len(ident_enc)}; "
+                                            "replayed cmd06 decrypted-header TPDUIdentInfo",
+                                        )
+
                                     chg, chg_enc, new_key = tgame_build_cmd01_chgskey(
                                         active_tgame_key, mode_now
                                     )
@@ -8702,12 +10009,80 @@ def handle_placeholder(conn, addr, label):
                                         role_state.get("persistent_resume")
                                         and label.upper() == "ZONE"
                                     ):
-                                        log(
-                                            label,
-                                            "Persistent TGame transport resumed; "
-                                            "waiting for client C2ZN_REQ_LOGIN before "
-                                            "sending the app login response",
+                                        # Verified restart-resume path: after
+                                        # cmd06 -> cmd08 -> cmd09 -> cmd04 -> cmd01,
+                                        # stock PH does not send a fresh A000. Replay
+                                        # the already-proven A001 login response, then
+                                        # let the normal FF05 deferred-profile path run.
+                                        uin_now = _v150_role_uin(role_state)
+                                        _V140_PLAYER_STATE.reload(uin_now)
+                                        persisted_nickname = PLAYER_DB.load_nickname(uin_now)
+                                        awaiting_first_nickname = persisted_nickname is None
+                                        role_state[
+                                            "v5_awaiting_first_nickname"
+                                        ] = awaiting_first_nickname
+
+                                        resume_base_seq = int(
+                                            role_state.get(
+                                                "persistent_resume_client_seq", 0
+                                            )
+                                        ) & 0xFFFFFFFF
+                                        seq_login = (resume_base_seq + 1) & 0xFFFFFFFF
+                                        seq_pinfo = (resume_base_seq + 2) & 0xFFFFFFFF
+                                        seq_props = (resume_base_seq + 3) & 0xFFFFFFFF
+                                        seq_hints = (resume_base_seq + 4) & 0xFFFFFFFF
+                                        login_result = (
+                                            0x0401
+                                            if awaiting_first_nickname
+                                            else ZONE_ERR_SUCC
                                         )
+                                        login_rsp = _v48_build_zn_login_response(
+                                            seq_login,
+                                            result=login_result,
+                                            expose_wallet=not awaiting_first_nickname,
+                                        )
+                                        _v48_send_app(
+                                            conn,
+                                            active_tgame_key,
+                                            login_rsp,
+                                            label,
+                                            "ZN2C_RES_LOGIN RESTART-RESUME-IDENT-A001 "
+                                            f"result=0x{login_result:04x} "
+                                            f"uin={uin_now} "
+                                            f"resume_client_seq=0x{resume_base_seq:08x} "
+                                            f"nickname={persisted_nickname!r}",
+                                        )
+
+                                        if awaiting_first_nickname:
+                                            # Mirror the normal A000 first-account gate.
+                                            role_state["v12_force_blank_nickname"] = True
+                                            role_state["v13_no_role_login"] = True
+                                            role_state["v20_force_a001_0401"] = True
+                                            pending_zone_profile = None
+                                            log(
+                                                label,
+                                                "Persistent resume A001 sent with result=0x0401; "
+                                                "first-nickname profile remains withheld",
+                                            )
+                                        else:
+                                            role_state.pop(
+                                                "v12_force_blank_nickname", None
+                                            )
+                                            role_state.pop(
+                                                "v13_no_role_login", None
+                                            )
+                                            pending_zone_profile = {
+                                                "seq_pinfo": seq_pinfo,
+                                                "seq_props": seq_props,
+                                                "seq_hints": seq_hints,
+                                                "first_nickname_probe": False,
+                                            }
+                                            log(
+                                                label,
+                                                "Persistent TGame transport resumed; "
+                                                "proactive A001 replay sent; waiting for FF05 "
+                                                "instead of waiting for a fresh A000",
+                                            )
                                 else:
                                     log(
                                         label,
@@ -8731,7 +10106,7 @@ def handle_placeholder(conn, addr, label):
                                     label,
                                     f"TGame {phase} cmd=0x{cmd_now:02x} "
                                     f"head_len={head_now} body_len={body_len_now} "
-                                    f"plain_len={len(plain_now)} plain={plain_now.hex()}"
+                                    f"plain_len={len(plain_now)} plain={_clan_debug_hex(plain_now)}"
                                 )
 
                                 if cmd_now == 0x0D:
@@ -8745,7 +10120,7 @@ def handle_placeholder(conn, addr, label):
                                         + (
                                             f"seq=0x{close_seq:08x}"
                                             if close_seq is not None
-                                            else f"plain={plain_now.hex()}"
+                                            else f"plain={_clan_debug_hex(plain_now)}"
                                         )
                                     )
                                     continue
@@ -8760,7 +10135,7 @@ def handle_placeholder(conn, addr, label):
                                     if (
                                         tgame_session_ticket is not None
                                         and tgame_session_uin is not None
-                                        and time.monotonic() - tgame_last_persist_touch >= 15.0
+                                        and time.monotonic() - tgame_last_persist_touch >= TGAME_SESSION_TOUCH_INTERVAL_SECONDS
                                     ):
                                         try:
                                             if touch_session(
@@ -8784,7 +10159,7 @@ def handle_placeholder(conn, addr, label):
                                         f"cmd=0x{app['cmd']:04x} "
                                         f"head_len={app['head_len']} "
                                         f"body_len={app['body_len']} "
-                                        f"body={_short_hex(app['body'], 128)}"
+                                        f"body={'<clan credentials redacted>' if app['cmd'] in CLAN_SENSITIVE_COMMANDS else _short_hex(app['body'], 128)}"
                                     )
 
                                     if label.upper() == "DS-TCP":
@@ -8796,7 +10171,7 @@ def handle_placeholder(conn, addr, label):
                                             f"cmd=0x{app['cmd']:04x} "
                                             f"head_len={app['head_len']} "
                                             f"body_len={app['body_len']} "
-                                            f"full_plain={plain_now.hex()}"
+                                            f"full_plain={_clan_debug_hex(plain_now)}"
                                         )
                                         # Do not accidentally feed DS traffic
                                         # to GEO/ZONE handlers.  The next
@@ -9132,6 +10507,19 @@ def handle_placeholder(conn, addr, label):
                                                     label,
                                                 )
 
+                                                # Existing profiles receive their newest
+                                                # durable Consumer List rows after A005/A006
+                                                # and wallet/EXP state are established.
+                                                if not first_nickname_profile:
+                                                    _v140_replay_moneyflow(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        label,
+                                                        session_uin=_v150_role_uin(
+                                                            role_state
+                                                        ),
+                                                    )
+
                                                 hints = _v48_build_zonehints(
                                                     pending_zone_profile["seq_hints"]
                                                 )
@@ -9229,6 +10617,9 @@ def handle_placeholder(conn, addr, label):
                                             )
 
                                         elif app["cmd"] == TGAME_ZN_REQ_TP_BALANCE:
+                                            # AP-NATIVE-REFRESH-v1:
+                                            # Website/DB changes are external to this process,
+                                            # so A50E is the explicit cache-refresh boundary.
                                             if len(app["body"]) != 8:
                                                 raise ValueError(
                                                     "A50E TP/AP balance request must be 8B"
@@ -9236,24 +10627,59 @@ def handle_placeholder(conn, addr, label):
                                             balance_uin = struct.unpack(
                                                 ">Q", app["body"]
                                             )[0]
+                                            session_uin = int(
+                                                _v150_role_uin(role_state)
+                                            )
+                                            if int(balance_uin) != session_uin:
+                                                log(
+                                                    label,
+                                                    "C2ZN_REQ_TPBALANCE "
+                                                    "WALLET-NATIVE-REFRESH-v2 "
+                                                    f"wire_uin={balance_uin} "
+                                                    f"session_uin={session_uin} "
+                                                    "action=USE_AUTHENTICATED_UIN",
+                                                )
+
+                                            # Reload the authoritative persisted wallet.
+                                            # This makes an AP value changed by the website
+                                            # visible without reconnecting the player.
+                                            _V140_PLAYER_STATE.reload(session_uin)
                                             wallet = _v140_wallet()
+
                                             log(
                                                 label,
-                                                "C2ZN_REQ_TPBALANCE v143v "
-                                                f"uin={balance_uin} "
+                                                "C2ZN_REQ_TPBALANCE "
+                                                "AP-NATIVE-REFRESH-v1 "
+                                                f"uin={session_uin} "
                                                 f"AP={wallet['ap']} "
-                                                "action=TEMP_LOCAL_GAMEPOINT_SYNC "
-                                                "wire_reply=NONE",
+                                                "action=SQLITE_RELOAD_NATIVE_A00A_AP_GP_MP",
                                             )
 
-                                            # TEMPORARY workaround: the stock PH
-                                            # native A50E response mapping is not yet
-                                            # verified.  Do not send guessed A00B/A506
-                                            # replies; refresh only the proven local
-                                            # GamePoint field from server state.
-                                            _V143V_LOCAL_AP_SYNC.request(
-                                                reason="A50E-refresh"
-                                            )
+                                            # The stock AP reload click is our explicit
+                                            # authoritative wallet refresh boundary.  AP,
+                                            # GP and MP are independent bitmask updates; do
+                                            # not mutate the wallet here.
+                                            for (
+                                                refresh_flag,
+                                                refresh_name,
+                                                refresh_reason,
+                                                pkt,
+                                            ) in _v140_build_authoritative_wallet_refresh():
+                                                _v48_send_app(
+                                                    conn,
+                                                    active_tgame_key,
+                                                    pkt,
+                                                    label,
+                                                    "ZN2C_NTF_UPDATEPLAYERPROPERTY "
+                                                    "WALLET-NATIVE-REFRESH-v2 "
+                                                    f"cmd=0xA00A flag={refresh_name} "
+                                                    f"flag_value=0x{refresh_flag:02X} "
+                                                    f"reason=0x{refresh_reason:02X} "
+                                                    f"uin={session_uin} "
+                                                    f"AP={wallet['ap']} "
+                                                    f"GP={wallet['gp']} "
+                                                    f"MP={wallet['mp']}",
+                                                )
 
                                         elif app["cmd"] == TGAME_ZN_REQ_BUYCOMMODITY:
                                             req = _v140_parse_buy_commodity(
@@ -9309,7 +10735,37 @@ def handle_placeholder(conn, addr, label):
                                                 wallet["gp"] -= int(plan["consume_gp"])
                                                 wallet["mp"] -= int(plan["consume_mp"])
 
-                                                _v140_save_state("buy")
+                                                purchase_uin = _v150_role_uin(
+                                                    role_state
+                                                )
+                                                purchase_time = int(time.time())
+                                                purchase_details = "; ".join(
+                                                    str(row.get("commodity_name", ""))
+                                                    for row in plan["staged"]
+                                                    if str(row.get("commodity_name", ""))
+                                                )
+                                                purchase_commodity_ids = [
+                                                    int(row["commodity_id"])
+                                                    for row in plan["staged"]
+                                                ]
+                                                purchase_moneyflow_rows = (
+                                                    _v140_make_purchase_moneyflow_rows(
+                                                        session_uin=purchase_uin,
+                                                        consume_tp=plan["consume_tp"],
+                                                        consume_gp=plan["consume_gp"],
+                                                        consume_mp=plan["consume_mp"],
+                                                        occurred_at=purchase_time,
+                                                        details=purchase_details,
+                                                        commodity_ids=purchase_commodity_ids,
+                                                    )
+                                                )
+
+                                                # Wallet, inventory and Consumer List rows
+                                                # become durable in one SQLite transaction.
+                                                _v140_save_state(
+                                                    "buy",
+                                                    moneyflow_rows=purchase_moneyflow_rows,
+                                                )
 
                                                 rsp = _v140_build_buy_response(
                                                     req,
@@ -9336,6 +10792,16 @@ def handle_placeholder(conn, addr, label):
                                                     label,
                                                     reason=UPDATE_REASON_BUY,
                                                     prefix="post-buy",
+                                                )
+
+                                                # Issue #42: publish the exact rows that were
+                                                # committed with the purchase transaction.
+                                                _v140_send_moneyflow_rows(
+                                                    conn,
+                                                    active_tgame_key,
+                                                    label,
+                                                    purchase_moneyflow_rows,
+                                                    source="live-buy",
                                                 )
 
                                                 # Publish the newly authoritative inventory.
@@ -9406,12 +10872,20 @@ def handle_placeholder(conn, addr, label):
                                                 active_tgame_key,
                                                 rsp,
                                                 label,
-                                                "ZN2C_RES_ITEM_OPERATION v140 "
+                                                "ZN2C_RES_ITEM_OPERATION v160 "
                                                 "cmd=0xA201 result=0x8100",
+                                            )
+                                            _v140_send_full_inventory(
+                                                conn,
+                                                active_tgame_key,
+                                                label,
+                                                prefix="v160-item-operation",
+                                                session_uin=session_uin,
                                             )
                                             log(
                                                 "MALL",
-                                                f"v140 A200 item operation => {action}",
+                                                "v160 A200 item operation => "
+                                                f"{action}; authoritative A006 refreshed",
                                             )
 
                                         elif app["cmd"] == TGAME_ZN_REQ_PROP_OPERATION:
@@ -9422,6 +10896,34 @@ def handle_placeholder(conn, addr, label):
                                             op = _r13_canonicalize_operation(
                                                 wire_op, session_uin
                                             )
+
+                                            # v165: preserve the subject's pre-operation
+                                            # ownership before _v111_apply_prop_operation()
+                                            # mutates it. This lets us dynamically identify
+                                            # root-level equipment TAKEOFF as well as EQUIP
+                                            # without knowing any item IDs.
+                                            _v165_pre_subject = _v140_find_prop(
+                                                int(op.get("subject_gid", 0))
+                                            )
+                                            _v165_pre_item_id = (
+                                                int(
+                                                    _v165_pre_subject.get(
+                                                        "item_id", 0
+                                                    )
+                                                )
+                                                if _v165_pre_subject is not None
+                                                else 0
+                                            )
+                                            _v165_pre_owner = (
+                                                int(
+                                                    _v165_pre_subject.get(
+                                                        "owner_gid", 0
+                                                    )
+                                                )
+                                                if _v165_pre_subject is not None
+                                                else 0
+                                            )
+
                                             action, effective_op = (
                                                 _v111_apply_prop_operation(op)
                                             )
@@ -9516,6 +11018,134 @@ def handle_placeholder(conn, addr, label):
                                                 if _v142_subject is not None
                                                 else 0
                                             )
+
+                                            # v165: root-level equipment changes can invalidate
+                                            # the stock Storage Weapon-tab cache even though the
+                                            # authoritative current bag and weapon ownership are
+                                            # still correct.
+                                            #
+                                            # Detect the CLASS of operation, not any specific
+                                            # item/bag:
+                                            #   - EQUIP or TAKEOFF
+                                            #   - real known subject
+                                            #   - not a character root
+                                            #   - not a backpack
+                                            #   - subject was or becomes attached to root owner 1
+                                            #
+                                            # Weapon changes remain excluded because their owner
+                                            # is a dynamic backpack GID, preserving v117's proven
+                                            # no-A006 behavior for weapon-slot operations.
+                                            _v165_root_equipment_change = (
+                                                _v165_pre_subject is not None
+                                                and int(
+                                                    op.get("operation", -1)
+                                                )
+                                                in (
+                                                    PROP_OP_EQUIP,
+                                                    PROP_OP_TAKEOFF,
+                                                )
+                                                and not _v140_is_role_item(
+                                                    _v165_pre_item_id
+                                                )
+                                                and not _v141_is_bag_item(
+                                                    _v165_pre_item_id
+                                                )
+                                                and (
+                                                    int(_v165_pre_owner)
+                                                    == V110_BAG_MOUNT_OWNER
+                                                    or int(
+                                                        effective_op.get(
+                                                            "target_gid", 0
+                                                        )
+                                                    )
+                                                    == V110_BAG_MOUNT_OWNER
+                                                )
+                                            )
+
+                                            if _v165_root_equipment_change:
+                                                _v165_bag_gid = (
+                                                    _v141_current_bag_gid()
+                                                )
+                                                _v165_bag = _v140_find_prop(
+                                                    _v165_bag_gid
+                                                )
+
+                                                if (
+                                                    _v165_bag is not None
+                                                    and _v141_is_bag_item(
+                                                        int(
+                                                            _v165_bag.get(
+                                                                "item_id", 0
+                                                            )
+                                                        )
+                                                    )
+                                                ):
+                                                    _v165_bag_body = (
+                                                        _v111_pack_prop_operation(
+                                                            _r13_project_operation(
+                                                                {
+                                                                    "operation": PROP_OP_EQUIP,
+                                                                    "subject_gid": _v165_bag_gid,
+                                                                    "target_gid": V110_BAG_MOUNT_OWNER,
+                                                                    "location": V109_LOC_BAG,
+                                                                },
+                                                                session_uin,
+                                                            )
+                                                        )
+                                                    )
+
+                                                    _v48_send_app(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        _v111_build_prop_operation_response(
+                                                            _v165_bag_body
+                                                        ),
+                                                        label,
+                                                        "ZN2C_RES_PROPOPERATION "
+                                                        "v165-root-item-current-bag "
+                                                        "cmd=0xA009 result=0x8100 "
+                                                        f"bag=0x{_v165_bag_gid:016x}",
+                                                    )
+                                                    _v48_send_app(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        _v111_build_prop_operation_notification(
+                                                            _v165_bag_body
+                                                        ),
+                                                        label,
+                                                        "ZN2C_NTF_PROPOPERATION "
+                                                        "v165-root-item-current-bag "
+                                                        "cmd=0xA00A "
+                                                        f"bag=0x{_v165_bag_gid:016x}",
+                                                    )
+                                                    _v140_send_full_inventory(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        label,
+                                                        prefix=(
+                                                            "v165-root-item-bag-reconcile"
+                                                        ),
+                                                        session_uin=session_uin,
+                                                    )
+                                                    log(
+                                                        label,
+                                                        "v165: dynamic root-equipment "
+                                                        "change reconciled selected bag + A006 "
+                                                        f"item={_v165_pre_item_id} "
+                                                        f"op={int(op.get('operation', -1))} "
+                                                        f"pre_owner=0x{int(_v165_pre_owner):016x} "
+                                                        f"post_owner=0x{int(effective_op.get('target_gid', 0)):016x} "
+                                                        f"bag=0x{_v165_bag_gid:016x}",
+                                                    )
+                                                else:
+                                                    log(
+                                                        label,
+                                                        "v165: root-equipment reconcile "
+                                                        "skipped: current bag does not resolve "
+                                                        "to an owned backpack "
+                                                        f"bag=0x{int(_v165_bag_gid):016x}",
+                                                    )
+
                                             if (
                                                 int(op.get("operation", -1)) == PROP_OP_EQUIP
                                                 and _v141_is_bag_item(_v142_item_id)
@@ -9534,6 +11164,37 @@ def handle_placeholder(conn, addr, label):
                                                     f"subject=0x{int(op.get('subject_gid',0)):016x} "
                                                     f"item={_v142_item_id} "
                                                     f"current_bag=0x{_v141_current_bag_gid():016x}",
+                                                )
+
+                                                # v157b: explicit Storage bag state must be
+                                                # republished after the lobby rebuilds.
+                                                role_state[
+                                                    "v157_storage_bag_resync_pending"
+                                                ] = True
+                                                role_state[
+                                                    "v157_storage_bag_resync_mainchan_base"
+                                                ] = int(
+                                                    role_state.get(
+                                                        "v125_mainchan_count", 0
+                                                    )
+                                                )
+                                                role_state[
+                                                    "v157_storage_bag_resync_a303_base"
+                                                ] = int(
+                                                    role_state.get(
+                                                        "v125_a303_count", 0
+                                                    )
+                                                )
+                                                role_state[
+                                                    "v125_bag1_refresh_armed"
+                                                ] = False
+                                                log(
+                                                    label,
+                                                    "v157b: explicit bag selection armed "
+                                                    "Storage->lobby resync "
+                                                    f"bag=0x{_v141_current_bag_gid():016x} "
+                                                    f"mainchan_base={int(role_state.get('v157_storage_bag_resync_mainchan_base', 0))} "
+                                                    f"a303_base={int(role_state.get('v157_storage_bag_resync_a303_base', 0))}",
                                                 )
 
                                             # v125: DO NOT refresh Bag1 here.
@@ -9578,51 +11239,113 @@ def handle_placeholder(conn, addr, label):
                                                     f"experience={int(V140_MALL_STATE.get('experience', 0))} "
                                                     "reason=role-equip-transaction-complete",
                                                 )
-                                                # v143 probe: v145 proved that after a character
-                                                # switch the BUG state and the manually FIXED
-                                                # Bag2->Bag1 state have identical CurrentRole,
-                                                # PreviewRole, CurrentBag and backend QBS09
-                                                # ownership. Test the smallest downstream rebuild
-                                                # trigger: replay ONLY the currently selected bag as
-                                                # an authoritative A00A notification after role
-                                                # commit. Do not alter backend state and do not
-                                                # synthesize a Bag2 toggle.
-                                                _v143_replay_bag_gid = _v141_current_bag_gid()
-                                                _v143_replay_bag = _v140_find_prop(
-                                                    _v143_replay_bag_gid
-                                                )
-                                                if _v143_replay_bag is not None:
-                                                    _v143_bag_body = _v111_pack_prop_operation(
-                                                        _r13_project_operation(
-                                                            {
-                                                                "operation": PROP_OP_EQUIP,
-                                                                "subject_gid": _v143_replay_bag_gid,
-                                                                "target_gid": V110_BAG_MOUNT_OWNER,
-                                                                "location": V109_LOC_BAG,
-                                                            },
-                                                            session_uin,
+                                                # v167: a stock role switch invalidates the
+                                                # Storage Weapon-tab contents cache.  The backend
+                                                # state remains correct (selected backpack and its
+                                                # weapon ownership do not change), but an A00A-only
+                                                # backpack replay is insufficient: the UI shows the
+                                                # selected bag with empty weapon slots until the user
+                                                # clicks that same bag again.
+                                                #
+                                                # Reconcile the ACTUAL selected backpack
+                                                # dynamically.  No Bag1/Bag2 GID, role, weapon or
+                                                # item ID is hard-coded:
+                                                #   role A008/A009/A00A
+                                                #     -> A005 current role
+                                                #     -> A00A current backpack
+                                                #     -> authoritative A006 inventory snapshot
+                                                #
+                                                # This intentionally remains role-switch scoped.
+                                                # v117's no-A006 rule for ordinary weapon A008
+                                                # operations is left unchanged.
+                                                _v167_bag_gid = _v141_current_bag_gid()
+                                                _v167_bag = _v140_find_prop(_v167_bag_gid)
+                                                if (
+                                                    _v167_bag is not None
+                                                    and _v141_is_bag_item(
+                                                        int(
+                                                            _v167_bag.get(
+                                                                "item_id", 0
+                                                            )
                                                         )
                                                     )
-                                                    _v143_bag_ntf = (
+                                                ):
+                                                    _v167_bag_body = (
+                                                        _v111_pack_prop_operation(
+                                                            _r13_project_operation(
+                                                                {
+                                                                    "operation": PROP_OP_EQUIP,
+                                                                    "subject_gid": _v167_bag_gid,
+                                                                    "target_gid": V110_BAG_MOUNT_OWNER,
+                                                                    "location": V109_LOC_BAG,
+                                                                },
+                                                                session_uin,
+                                                            )
+                                                        )
+                                                    )
+                                                    # v168: v167 proved that A00A + A006 alone is
+                                                    # not enough after a role switch.  The already-
+                                                    # proven v165 Item-tab fix and a real manual bag
+                                                    # click both use the complete stock callback
+                                                    # sequence A009 -> A00A -> A006.  Reuse that
+                                                    # sequence here for the dynamically selected bag.
+                                                    #
+                                                    # A009 is intentionally emitted before A00A,
+                                                    # matching the normal A008 bag-selection handler.
+                                                    # Backend ownership is NOT changed here.
+                                                    _v168_bag_rsp = (
+                                                        _v111_build_prop_operation_response(
+                                                            _v167_bag_body
+                                                        )
+                                                    )
+                                                    _v168_bag_ntf = (
                                                         _v111_build_prop_operation_notification(
-                                                            _v143_bag_body
+                                                            _v167_bag_body
                                                         )
                                                     )
                                                     _v48_send_app(
                                                         conn,
                                                         active_tgame_key,
-                                                        _v143_bag_ntf,
+                                                        _v168_bag_rsp,
+                                                        label,
+                                                        "ZN2C_RES_PROPOPERATION "
+                                                        "v168-post-role-current-bag "
+                                                        "cmd=0xA009 result=0x8100 "
+                                                        f"bag=0x{_v167_bag_gid:016x}",
+                                                    )
+                                                    _v48_send_app(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        _v168_bag_ntf,
                                                         label,
                                                         "ZN2C_NTF_PROPOPERATION "
-                                                        "v143-post-role-current-bag-replay "
-                                                        f"bag=0x{_v143_replay_bag_gid:016x}",
+                                                        "v168-post-role-current-bag "
+                                                        "cmd=0xA00A "
+                                                        f"bag=0x{_v167_bag_gid:016x}",
+                                                    )
+                                                    _v140_send_full_inventory(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        label,
+                                                        prefix=(
+                                                            "v168-post-role-bag-reconcile"
+                                                        ),
+                                                        session_uin=session_uin,
                                                     )
                                                     log(
                                                         label,
-                                                        "v143 probe: role commit complete; "
-                                                        "replayed current bag A00A only "
-                                                        f"bag=0x{_v143_replay_bag_gid:016x} "
-                                                        "(no state change, no A006, no fake Bag2)",
+                                                        "v168: role switch replayed complete "
+                                                        "dynamic bag callback A009+A00A+A006 "
+                                                        f"bag=0x{_v167_bag_gid:016x} "
+                                                        f"bag_item={int(_v167_bag.get('item_id', 0))}",
+                                                    )
+                                                else:
+                                                    log(
+                                                        label,
+                                                        "v167: post-role bag reconcile "
+                                                        "skipped because current bag does not "
+                                                        "resolve to an owned backpack "
+                                                        f"bag=0x{int(_v167_bag_gid):016x}",
                                                     )
                                                 # Keep the old Bag1 refresh compatibility only for
                                                 # the starter role; purchased roles do not need to arm
@@ -9636,6 +11359,9 @@ def handle_placeholder(conn, addr, label):
                                                     f"gid=0x{_v140_current_role_gid():016x} "
                                                     f"item={int(_v140_role_subject.get('item_id',0))}"
                                                 )
+
+                                        elif app["cmd"] in CLAN_COMMANDS:
+                                            _clan_dispatch(conn, active_tgame_key, app, tgame_session_uin, label)
 
                                         elif app["cmd"] == TGAME_ZN_REQ_CHECK_NICKNAME:
                                             nick = None
@@ -10434,6 +12160,7 @@ def handle_placeholder(conn, addr, label):
                                                 f"room_name={cr['name']!r} "
                                                 f"mode=0x{cr['mode_id']:08x} "
                                                 f"map=0x{cr['map_id']:04x} "
+                                                f"map_string={cr.get('map_string', '')!r} "
                                                 f"submode=0x{cr['sub_mode_id']:08x} "
                                                 f"flags=0x{cr['flags']:08x} "
                                                 f"fighters={cr['fighter_capacity']} "
@@ -10504,8 +12231,8 @@ def handle_placeholder(conn, addr, label):
                                                 "enabled and stale A100/A102 suppressed"
                                             )
 
-                                        elif app["cmd"] == TGAME_ZN_REQ_ENTERMATCHROOM:
-                                            er = _v150_parse_enter_match_room(app["body"])
+                                        elif app["cmd"] in (TGAME_ZN_REQ_ENTERMATCHROOM, 0xA120):
+                                            er = (_v178_parse_trace_enter(app["body"], role_state) if app["cmd"] == 0xA120 else _v150_parse_enter_match_room(app["body"]))
                                             uin_now = _v150_role_uin(role_state)
                                             nickname_now = _v150_role_nickname(role_state)
                                             prior_room = V150_ROOM_REGISTRY.room_for_player(uin_now)
@@ -10518,7 +12245,7 @@ def handle_placeholder(conn, addr, label):
                                                     password=er["password"],
                                                     observer=er["observer"],
                                                 )
-                                                if V143B_DS_CONFIG.enabled:
+                                                if (V143B_DS_CONFIG.enabled and not (app["cmd"] == 0xA120 and er.get("invite_id") is not None)):
                                                     V143B_DS_SPAWNER.register_room_player(
                                                         int(joined_room["room_id"]),
                                                         uin_now,
@@ -10562,6 +12289,18 @@ def handle_placeholder(conn, addr, label):
                                                 _v150_sync_role_states(joined_room)
 
                                                 enter_rsp = _v150_build_res_enter_match_room(joined_room)
+                                                if app["cmd"] == 0xA120:
+                                                    # Same MatchRoomInfo layout, distinct native callback for trace entry.
+                                                    enter_rsp = _v62_build_server_app(TGAME_ZN_MAGIC, 0xA121, _v48_u16(0x8300) + enter_rsp[10:])
+                                                    invite_id = er.get('invite_id')
+                                                    if invite_id is not None:
+                                                        with _V150_ZONE_LOCK:
+                                                            _V177_ROOM_INVITES.pop(invite_id, None)
+                                                        decision = _v62_build_server_app(TGAME_ZN_MAGIC, 0xA316,
+                                                            _v50_geo_tdr_string(nickname_now, 32) + _v48_u16(0x8300) + _v48_i32(0))
+                                                        _v150_send_online(er['inviter'], decision, 'v178 invitation accepted and room joined')
+                                                log('SOCIAL', f'v178 room entry request=0x{app["cmd"]:04X} response=0x{(0xA121 if app["cmd"] == 0xA120 else TGAME_ZN_RES_ENTERMATCHROOM):04X} uin={uin_now} room={joined_room["room_id"]}')
+
                                                 _v48_send_app(
                                                     conn,
                                                     active_tgame_key,
@@ -10571,6 +12310,18 @@ def handle_placeholder(conn, addr, label):
                                                     f"cmd=0xA105 result=0x8100 room={joined_room['room_id']} "
                                                     f"players={len(joined_room['members'])} seat={member['seat_index']}",
                                                 )
+
+                                                if app["cmd"] == 0xA120:
+                                                    # A121 reports trace success; A105 drives the stock room UI transition.
+                                                    standard_enter_rsp = _v150_build_res_enter_match_room(joined_room)
+                                                    _v48_send_app(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        standard_enter_rsp,
+                                                        label,
+                                                        f"ZN2C_RES_ENTERMATCHROOM invite-transition cmd=0xA105 room={joined_room['room_id']}",
+                                                    )
+                                                    log("SOCIAL", f"v182 sent normal A105 transition to accepted invitee uin={uin_now} room={joined_room['room_id']}")
 
                                                 ntf = _v150_build_ntf_enter_match_room(member)
                                                 notified = []
@@ -11832,41 +13583,587 @@ def handle_placeholder(conn, addr, label):
                                                 # only missing server-side message from the
                                                 # known-good transaction, so send the exact pair
                                                 # here without rebuilding A006.
-                                                bag_op = _v111_pack_prop_operation(
-                                                    _r13_project_operation(
-                                                        {
-                                                            "operation": PROP_OP_EQUIP,
-                                                            "subject_gid": V109_BAG1_GID,
-                                                            "target_gid": V110_BAG_MOUNT_OWNER,
-                                                            "location": V109_LOC_BAG,
-                                                        },
-                                                        _v150_role_uin(role_state),
+                                                # v158: retain proven second-A303 timing but
+                                                # replay the authoritative selected backpack.
+                                                _v158_bag_gid = _v141_current_bag_gid()
+                                                _v158_bag = _v140_find_prop(_v158_bag_gid)
+
+                                                if (
+                                                    _v158_bag is not None
+                                                    and _v141_is_bag_item(
+                                                        int(_v158_bag.get("item_id", 0))
                                                     )
+                                                ):
+                                                    _v158_bag_op = _v111_pack_prop_operation(
+                                                        _r13_project_operation(
+                                                            {
+                                                                "operation": PROP_OP_EQUIP,
+                                                                "subject_gid": _v158_bag_gid,
+                                                                "target_gid": V110_BAG_MOUNT_OWNER,
+                                                                "location": V109_LOC_BAG,
+                                                            },
+                                                            _v150_role_uin(role_state),
+                                                        )
+                                                    )
+                                                    _v48_send_app(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        _v111_build_prop_operation_response(
+                                                            _v158_bag_op
+                                                        ),
+                                                        label,
+                                                        "ZN2C_RES_PROPOPERATION "
+                                                        "v158-lobby-ready-current-bag "
+                                                        "cmd=0xA009 result=0x8100 "
+                                                        f"bag=0x{_v158_bag_gid:016x} "
+                                                        f"item={int(_v158_bag.get('item_id', 0))}",
+                                                    )
+                                                    _v48_send_app(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        _v111_build_prop_operation_notification(
+                                                            _v158_bag_op
+                                                        ),
+                                                        label,
+                                                        "ZN2C_NTF_PROPOPERATION "
+                                                        "v158-lobby-ready-current-bag "
+                                                        "cmd=0xA00A "
+                                                        f"bag=0x{_v158_bag_gid:016x} "
+                                                        f"item={int(_v158_bag.get('item_id', 0))}",
+                                                    )
+                                                    role_state[
+                                                        "v126_bag1_full_transaction_sent"
+                                                    ] = True
+                                                    log(
+                                                        label,
+                                                        "v158: lobby-ready DYNAMIC current-bag "
+                                                        "transaction sent A009+A00A "
+                                                        f"bag=0x{_v158_bag_gid:016x} "
+                                                        f"item={int(_v158_bag.get('item_id', 0))}; "
+                                                        "legacy v126 timing retained; "
+                                                        "no hard-coded Bag1",
+                                                    )
+                                                else:
+                                                    log(
+                                                        label,
+                                                        "v158: lobby-ready dynamic bag replay "
+                                                        "skipped because current_bag_gid does not "
+                                                        "resolve to an owned bag "
+                                                        f"gid=0x{int(_v158_bag_gid):016x}",
+                                                    )
+                                            # v157b: on a Storage->lobby transition, replay the
+                                            # selected bag and a complete inventory snapshot.
+                                            _v157_pending = bool(
+                                                role_state.get(
+                                                    "v157_storage_bag_resync_pending"
                                                 )
-                                                bag_rsp = _v111_build_prop_operation_response(bag_op)
+                                            )
+                                            _v157_mainchan_base = int(
+                                                role_state.get(
+                                                    "v157_storage_bag_resync_mainchan_base",
+                                                    0,
+                                                )
+                                            )
+                                            _v157_a303_base = int(
+                                                role_state.get(
+                                                    "v157_storage_bag_resync_a303_base",
+                                                    0,
+                                                )
+                                            )
+                                            _v157_a303_now = int(
+                                                role_state.get(
+                                                    "v125_a303_count", 0
+                                                )
+                                            )
+                                            _v157_mainchan_now = int(
+                                                role_state.get(
+                                                    "v125_mainchan_count", 0
+                                                )
+                                            )
+                                            if (
+                                                _v157_pending
+                                                and _v157_mainchan_now > _v157_mainchan_base
+                                                and _v157_a303_now >= (_v157_a303_base + 2)
+                                            ):
+                                                _v157_bag_gid = _v141_current_bag_gid()
+                                                _v157_bag = _v140_find_prop(_v157_bag_gid)
+                                                if _v157_bag is not None:
+                                                    _v157_bag_op = _v111_pack_prop_operation(
+                                                        _r13_project_operation(
+                                                            {
+                                                                "operation": PROP_OP_EQUIP,
+                                                                "subject_gid": _v157_bag_gid,
+                                                                "target_gid": V110_BAG_MOUNT_OWNER,
+                                                                "location": V109_LOC_BAG,
+                                                            },
+                                                            _v150_role_uin(role_state),
+                                                        )
+                                                    )
+                                                    _v48_send_app(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        _v111_build_prop_operation_response(
+                                                            _v157_bag_op
+                                                        ),
+                                                        label,
+                                                        "ZN2C_RES_PROPOPERATION "
+                                                        "v157b-lobby-current-bag "
+                                                        "cmd=0xA009 result=0x8100 "
+                                                        f"bag=0x{_v157_bag_gid:016x}",
+                                                    )
+                                                    _v48_send_app(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        _v111_build_prop_operation_notification(
+                                                            _v157_bag_op
+                                                        ),
+                                                        label,
+                                                        "ZN2C_NTF_PROPOPERATION "
+                                                        "v157b-lobby-current-bag "
+                                                        "cmd=0xA00A "
+                                                        f"bag=0x{_v157_bag_gid:016x}",
+                                                    )
+                                                    _v140_send_full_inventory(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        label,
+                                                        prefix="v157b-lobby-bag-resync",
+                                                        session_uin=_v150_role_uin(role_state),
+                                                    )
+                                                    log(
+                                                        label,
+                                                        "v157b: Storage->lobby current-bag "
+                                                        "resync sent A009+A00A+A006 "
+                                                        f"bag=0x{_v157_bag_gid:016x}",
+                                                    )
+                                                else:
+                                                    log(
+                                                        label,
+                                                        "v157b: Storage->lobby resync skipped: "
+                                                        f"current bag prop missing gid=0x{_v157_bag_gid:016x}",
+                                                    )
+
+                                                role_state[
+                                                    "v157_storage_bag_resync_pending"
+                                                ] = False
+                                                role_state.pop(
+                                                    "v157_storage_bag_resync_mainchan_base",
+                                                    None,
+                                                )
+                                                role_state.pop(
+                                                    "v157_storage_bag_resync_a303_base",
+                                                    None,
+                                                )
+
+# v165: service A303 after the existing lobby/bag operations above.
+                                            try:
+                                                social_req = parse_friend_status_request(app["body"])
+                                                social_uin = _v150_role_uin(role_state)
+                                                social_friends = FRIENDS_SERVICE.list_friends(social_uin)
+                                                social_online = _v165_online_uins()
+
                                                 _v48_send_app(
-                                                    conn, active_tgame_key,
-                                                    bag_rsp, label,
-                                                    "ZN2C_RES_PROPOPERATION v126-lobby-ready-Bag1 "
-                                                    "cmd=0xA009 result=0x8100 subject=Bag1 "
-                                                    "target=1 loc=0x0c",
-                                                )
-                                                bag_ntf = _v111_build_prop_operation_notification(bag_op)
-                                                _v48_send_app(
-                                                    conn, active_tgame_key,
-                                                    bag_ntf, label,
-                                                    "ZN2C_NTF_PROPOPERATION v126-lobby-ready-Bag1 "
-                                                    "cmd=0xA00A subject=Bag1 target=1 loc=0x0c",
-                                                )
-                                                role_state["v126_bag1_full_transaction_sent"] = True
-                                                log(
+                                                    conn,
+                                                    active_tgame_key,
+                                                    build_friend_status_response(
+                                                        int(social_req["type"]),
+                                                        list(social_req["uins"]),
+                                                        social_friends,
+                                                        social_online,
+                                                    ),
                                                     label,
-                                                    "v126: lobby-ready Bag1 FULL server transaction "
-                                                    "sent: A009(success)+A00A after A355/A356 + second A303; "
-                                                    "no post-login A006 rebuild; starter extras came from legal login A006 chunk 2"
+                                                    "ZN2C_RES_FRIENDSTATUS v165-real "
+                                                    f"cmd=0xA304 friends={len(social_friends)} "
+                                                    f"type={int(social_req['type'])}",
                                                 )
-                                            # Deliberately leave the A303 social request itself
-                                            # unanswered in this recovery build, matching v124.
+
+                                                seeded = 0
+                                                if not role_state.get("v165_social_seeded"):
+                                                    # v171: do NOT replay A308 for already-persisted friends.
+                                                    # A308 is an add-friend completion/message, not a login seed.
+                                                    role_state["v165_social_seeded"] = True
+                                                # v172: A326 is an event notification, not part of the
+                                                # level-triggered A303 response. The PH client immediately re-issues
+                                                # A303 after receiving A326, so sending A326 on every A303 creates a
+                                                # self-sustaining refresh loop. Emit only initial state or a real
+                                                # online/offline transition for this client session.
+                                                _presence_state = role_state.setdefault("v172_presence_state", {})
+                                                presence_sent = 0
+                                                for _friend in social_friends:
+                                                    _friend_uin = int(_friend["uin"])
+                                                    _friend_online = bool(_friend_uin in social_online)
+                                                    _previous = _presence_state.get(_friend_uin)
+                                                    if _previous is None or bool(_previous) != _friend_online:
+                                                        _v48_send_app(
+                                                            conn,
+                                                            active_tgame_key,
+                                                            build_friend_loginout(
+                                                                _friend_uin,
+                                                                _friend_online,
+                                                            ),
+                                                            label,
+                                                            "ZN2C_NTF_FRIENDLOGINOUT v172-edge "
+                                                            f"friend={_friend_uin} "
+                                                            f"online={_friend_online} "
+                                                            f"type={1 if _friend_online else 2} "
+                                                            f"previous={_previous}",
+                                                            tpdu_cmd=2,
+                                                        )
+                                                        _presence_state[_friend_uin] = _friend_online
+                                                        presence_sent += 1
+
+                                                # Forget removed friends so a later re-add gets a fresh initial edge.
+                                                _friend_uin_set = {int(_f["uin"]) for _f in social_friends}
+                                                for _old_uin in list(_presence_state):
+                                                    if int(_old_uin) not in _friend_uin_set:
+                                                        _presence_state.pop(_old_uin, None)
+
+                                                pending_req, pending_pm = _v165_deliver_pending_social(social_uin)
+                                                log(
+                                                    "SOCIAL",
+                                                    "v165 social-ready "
+                                                    f"uin={social_uin} friends={len(social_friends)} "
+                                                    f"seeded={seeded} friend_requests={pending_req} "
+                                                    f"private_messages={pending_pm}",
+                                                )
+                                            except Exception as social_e:
+                                                log(
+                                                    "SOCIAL",
+                                                    "A303 social processing FAILED: "
+                                                    f"{type(social_e).__name__}: {social_e}; "
+                                                    f"body={app['body'].hex()}",
+                                                )
+
+                                        elif app["cmd"] == TGAME_ZN_REQ_ADD_FRIEND:
+                                            try:
+                                                social_uin = _v150_role_uin(role_state)
+                                                social_name = _v150_role_nickname(role_state)
+                                                req = parse_add_friend_request(app["body"])
+                                                target = FRIENDS_SERVICE.find_player(
+                                                    uin=int(req["respondent_uin"] or 0),
+                                                    nickname=str(req["respondent_name"] or ""),
+                                                )
+                                                if target is None:
+                                                    log(
+                                                        "SOCIAL",
+                                                        "A305 target not found; no fabricated failure enum sent "
+                                                        f"uin={req['respondent_uin']} name={req['respondent_name']!r}",
+                                                    )
+                                                    continue
+                                                if int(target["uin"]) == social_uin:
+                                                    log("SOCIAL", f"A305 self-add ignored uin={social_uin}")
+                                                    continue
+
+                                                created = FRIENDS_SERVICE.create_friend_request(
+                                                    social_uin,
+                                                    int(target["uin"]),
+                                                    str(req["remark"] or ""),
+                                                )
+
+                                                if created.get("already_friends"):
+                                                    _v48_send_app(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        build_add_friend_result(
+                                                            friend_uin=int(target["uin"]),
+                                                            friend_name=str(target["nickname"]),
+                                                            result=0x8301,  # SNS_ADDFRID_AGREE
+                                                            msg_id=0,
+                                                        ),
+                                                        label,
+                                                        "ZN2C_RES_ADDFRIEND v168-already-friends-agree "
+                                                        f"peer={target['nickname']}({int(target['uin'])})",
+                                                    )
+                                                elif created.get("opposite_pending"):
+                                                    proposer = FRIENDS_SERVICE.get_player_identity(int(created["from_uin"]))
+                                                    if proposer is not None:
+                                                        _v48_send_app(
+                                                            conn,
+                                                            active_tgame_key,
+                                                            build_friend_invite(
+                                                                request_id=int(created["request_id"]),
+                                                                proposer_uin=int(created["from_uin"]),
+                                                                proposer_name=str(proposer["nickname"]),
+                                                                remark=str(created.get("remark") or ""),
+                                                                msg_id=int(created.get("msg_id") or created["request_id"]),
+                                                            ),
+                                                            label,
+                                                            "ZN2C_REQ_ADDFRIEND v165-opposite-pending "
+                                                            f"request_id={int(created['request_id'])}",
+                                                        )
+                                                else:
+                                                    invite = build_friend_invite(
+                                                        request_id=int(created["request_id"]),
+                                                        proposer_uin=social_uin,
+                                                        proposer_name=social_name,
+                                                        remark=str(created.get("remark") or ""),
+                                                        msg_id=int(created.get("msg_id") or created["request_id"]),
+                                                    )
+                                                    delivered = _v150_send_online(
+                                                        int(target["uin"]),
+                                                        invite,
+                                                        "ZN2C_REQ_ADDFRIEND v165-real "
+                                                        f"request_id={int(created['request_id'])} "
+                                                        f"from={social_name}({social_uin})",
+                                                    )
+                                                    log(
+                                                        "SOCIAL",
+                                                        "A305 friend request persisted "
+                                                        f"id={int(created['request_id'])} from={social_uin} "
+                                                        f"to={int(target['uin'])} delivered_now={delivered}",
+                                                    )
+                                            except Exception as social_e:
+                                                log(
+                                                    "SOCIAL",
+                                                    "A305 FAILED: "
+                                                    f"{type(social_e).__name__}: {social_e}; "
+                                                    f"body={app['body'].hex()}",
+                                                )
+
+                                        elif app["cmd"] == TGAME_ZN_C2S_RES_ADD_FRIEND:
+                                            try:
+                                                social_uin = _v150_role_uin(role_state)
+                                                rsp = parse_add_friend_client_response(app["body"])
+                                                accepted = int(rsp["result"]) == 0x8301  # PH A307: live Accept button decision code
+                                                request_row = FRIENDS_SERVICE.resolve_friend_request(
+                                                    int(rsp["request_id"]),
+                                                    social_uin,
+                                                    accepted,
+                                                )
+                                                proposer_uin = int(request_row["from_uin"])
+
+                                                if accepted:
+                                                    proposer = FRIENDS_SERVICE.get_player_identity(proposer_uin)
+                                                    acceptor = FRIENDS_SERVICE.get_player_identity(social_uin)
+                                                    if proposer is None or acceptor is None:
+                                                        raise FriendsError("accepted friend request identity disappeared")
+                                                    msg_id = int(request_row.get("msg_id") or rsp["request_id"])
+
+                                                    _v48_send_app(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        build_add_friend_result(
+                                                            friend_uin=proposer_uin,
+                                                            friend_name=str(proposer["nickname"]),
+                                                            result=0x8301,  # SNS_ADDFRID_AGREE
+                                                            msg_id=msg_id,
+                                                        ),
+                                                        label,
+                                                        "ZN2C_RES_ADDFRIEND v168-agree-self "
+                                                        f"peer={proposer['nickname']}({proposer_uin})",
+                                                    )
+                                                    _v150_send_online(
+                                                        proposer_uin,
+                                                        build_add_friend_result(
+                                                            friend_uin=social_uin,
+                                                            friend_name=str(acceptor["nickname"]),
+                                                            result=0x8301,  # SNS_ADDFRID_AGREE
+                                                            msg_id=msg_id,
+                                                        ),
+                                                        "ZN2C_RES_ADDFRIEND v168-agree-peer "
+                                                        f"peer={acceptor['nickname']}({social_uin})",
+                                                    )
+
+                                                log(
+                                                    "SOCIAL",
+                                                    "A307 friend request resolved "
+                                                    f"id={int(rsp['request_id'])} acceptor={social_uin} "
+                                                    f"accepted={accepted} result=0x{int(rsp['result']):04x}",
+                                                )
+                                            except Exception as social_e:
+                                                log(
+                                                    "SOCIAL",
+                                                    "A307 FAILED: "
+                                                    f"{type(social_e).__name__}: {social_e}; "
+                                                    f"body={app['body'].hex()}",
+                                                )
+
+                                        elif app["cmd"] == TGAME_ZN_REQ_DEL_FRIEND:
+                                            try:
+                                                social_uin = _v150_role_uin(role_state)
+                                                friend_uin = parse_delete_friend_request(app["body"])
+                                                existed = FRIENDS_SERVICE.delete_friendship(social_uin, int(friend_uin))
+                                                _v48_send_app(
+                                                    conn,
+                                                    active_tgame_key,
+                                                    build_delete_friend_response(int(friend_uin), SNS_ERR_SUCC),
+                                                    label,
+                                                    "ZN2C_RES_DELFRIEND v165-real "
+                                                    f"cmd=0xA30A friend_uin={int(friend_uin)}",
+                                                )
+                                                log(
+                                                    "SOCIAL",
+                                                    f"A309 friendship deleted uin={social_uin} "
+                                                    f"friend={int(friend_uin)} existed={existed}",
+                                                )
+                                            except Exception as social_e:
+                                                log(
+                                                    "SOCIAL",
+                                                    "A309 FAILED: "
+                                                    f"{type(social_e).__name__}: {social_e}; "
+                                                    f"body={app['body'].hex()}",
+                                                )
+
+                                        elif app["cmd"] == TGAME_ZN_REQ_QUERY_FRIEND:
+                                            try:
+                                                query = parse_query_friend_request(app["body"])
+                                                qtype = int(query["query_type"])
+                                                qu = int(query["query_uin"] or 0)
+                                                qc = str(query["query_content"] or "")
+
+                                                if qtype == 2:
+                                                    target = FRIENDS_SERVICE.find_player(nickname=qc)
+                                                else:
+                                                    target_uin = qu
+                                                    if not target_uin and qc.strip().isdigit():
+                                                        target_uin = int(qc.strip())
+                                                    target = FRIENDS_SERVICE.find_player(uin=target_uin) if target_uin else None
+
+                                                if target is None:
+                                                    log(
+                                                        "SOCIAL",
+                                                        "A30F Find Player unresolved; no unverified not-found A310 sent "
+                                                        f"type={qtype} query_uin={qu} content={qc!r}",
+                                                    )
+                                                else:
+                                                    out = build_query_friend_response(
+                                                        target,
+                                                        result=0x8100,  # QueryFriend stock-UI success
+                                                        privacy_flags=EPTE_ADD_BY_ALL,
+                                                    )
+                                                    _v48_send_app(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        out,
+                                                        label,
+                                                        "ZN2C_RES_FINDFRIEND v166-ui-success "
+                                                        f"cmd=0xA310 uin={int(target['uin'])} "
+                                                        f"nickname={target['nickname']!r} "
+                                                        f"exp={int(target.get('experience') or 0)} "
+                                                        "privacy_flags=0x0001",
+                                                    )
+                                                    log(
+                                                        "SOCIAL",
+                                                        "A30F Find Player resolved -> A310 v166 UI-success response sent "
+                                                        f"type={qtype} query_uin={qu} content={qc!r} resolved={target}",
+                                                    )
+                                            except Exception as social_e:
+                                                log(
+                                                    "SOCIAL",
+                                                    "A30F FAILED: "
+                                                    f"{type(social_e).__name__}: {social_e}; "
+                                                    f"body={app['body'].hex()}",
+                                                )
+
+                                        elif app["cmd"] in (0xA313, 0xA315, 0xA317):
+                                            _v177_friend_action(conn, active_tgame_key, label, role_state, app)
+
+                                        elif app["cmd"] == TGAME_ZN_REQ_CHAT_P2P:
+                                            try:
+                                                social_uin = _v150_role_uin(role_state)
+                                                social_name = _v150_role_nickname(role_state)
+                                                chat = parse_chat_p2p_request(app["body"])
+                                                target = FRIENDS_SERVICE.find_player(
+                                                    uin=int(chat["recipient_uin"] or 0),
+                                                    nickname=str(chat["recipient_name"] or ""),
+                                                )
+                                                if target is None:
+                                                    raise FriendsError("chat recipient does not exist")
+
+                                                stored = FRIENDS_SERVICE.store_private_message(
+                                                    social_uin,
+                                                    int(target["uin"]),
+                                                    int(chat["chat_type"]),
+                                                    str(chat["message"]),
+                                                )
+                                                ntf = build_chat_p2p_notify(
+                                                    int(chat["chat_type"]),
+                                                    str(chat["message"]),
+                                                    sender_uin=social_uin,
+                                                    sender_name=social_name,
+                                                )
+                                                delivered = _v150_send_online(
+                                                    int(target["uin"]),
+                                                    ntf,
+                                                    "ZN2C_NTF_CHATP2P v165-real "
+                                                    f"message_id={int(stored['message_id'])} "
+                                                    f"from={social_name}({social_uin})",
+                                                )
+                                                if delivered:
+                                                    FRIENDS_SERVICE.mark_private_message_delivered(int(stored["message_id"]))
+
+                                                log(
+                                                    "SOCIAL",
+                                                    "A405 private chat "
+                                                    f"id={int(stored['message_id'])} from={social_uin} "
+                                                    f"to={int(target['uin'])} delivered_now={delivered}",
+                                                )
+                                            except Exception as social_e:
+                                                log(
+                                                    "SOCIAL",
+                                                    "A405 FAILED: "
+                                                    f"{type(social_e).__name__}: {social_e}; "
+                                                    f"body={app['body'].hex()}",
+                                                )
+
+                                        elif app["cmd"] == TGAME_ZN_NTF_READ_OFFLINE_MSG:
+                                            try:
+                                                _read = parse_read_offline_message_notice(app["body"])
+                                                log(
+                                                    "SOCIAL",
+                                                    "AB03 NtfReadOfflineMessage v171 "
+                                                    f"uin={_v150_role_uin(role_state)} "
+                                                    f"count={int(_read['count'])} "
+                                                    f"msg_ids={list(_read['msg_ids'])}",
+                                                )
+                                            except Exception as social_e:
+                                                log(
+                                                    "SOCIAL",
+                                                    "AB03 NtfReadOfflineMessage FAILED: "
+                                                    f"{type(social_e).__name__}: {social_e}; "
+                                                    f"body={app['body'].hex()}",
+                                                )
+
+                                        elif app["cmd"] == TGAME_ZN_REQ_PLAYER_EXP:
+                                            try:
+                                                exp_req = parse_player_exp_request(app["body"])
+                                                exp_uins = [int(v) for v in exp_req["uins"]]
+                                                exp_values = []
+                                                for _exp_uin in exp_uins:
+                                                    _identity = FRIENDS_SERVICE.get_player_identity(
+                                                        _exp_uin
+                                                    )
+                                                    exp_values.append(
+                                                        int((_identity or {}).get("experience") or 0)
+                                                    )
+
+                                                _v48_send_app(
+                                                    conn,
+                                                    active_tgame_key,
+                                                    build_player_exp_response(
+                                                        int(exp_req["type"]),
+                                                        exp_uins,
+                                                        exp_values,
+                                                    ),
+                                                    label,
+                                                    "ZN2C_RES_PLAYEREXP v170-static "
+                                                    f"cmd=0xA33B type={int(exp_req['type'])} "
+                                                    f"uins={exp_uins} exps={exp_values}",
+                                                )
+                                                log(
+                                                    "SOCIAL",
+                                                    "A33A GetPlayerExps v170-static "
+                                                    f"requester={_v150_role_uin(role_state)} "
+                                                    f"type={int(exp_req['type'])} "
+                                                    f"uins={exp_uins} exps={exp_values}",
+                                                )
+                                            except Exception as social_e:
+                                                log(
+                                                    "SOCIAL",
+                                                    "A33A GetPlayerExps FAILED: "
+                                                    f"{type(social_e).__name__}: {social_e}; "
+                                                    f"body={app['body'].hex()}",
+                                                )
 
                                         elif app["cmd"] == TGAME_ZN_REQ_STARTROOMALLOC:
                                             requester_uin = _v150_role_uin(role_state)
@@ -11954,6 +14251,130 @@ def handle_placeholder(conn, addr, label):
                                                     "A3A0 accepted but dynamic DS handoff failed; "
                                                     "partial match state rolled back; no dead endpoint advertised",
                                                 )
+
+                                        elif app["cmd"] == TGAME_ZN_REQ_USE_CARD:
+                                            try:
+                                                func_type, sub_func_type = (
+                                                    _v160_parse_use_card(app["body"])
+                                                )
+                                            except ValueError as use_e:
+                                                log(
+                                                    "MALL-ITEM",
+                                                    f"A347 UseCard rejected: {use_e}",
+                                                )
+                                                use_result = ZONE_FAIL_NOACCOUNTEXIST
+                                                use_action = "malformed request"
+                                                use_prop = None
+                                            else:
+                                                use_prop, use_action = (
+                                                    _v160_activate_known_function_card(
+                                                        func_type, sub_func_type
+                                                    )
+                                                )
+                                                use_result = (
+                                                    ZONE_ERR_SUCC
+                                                    if use_prop is not None
+                                                    else ZONE_FAIL_NOACCOUNTEXIST
+                                                )
+
+                                            _v48_send_app(
+                                                conn,
+                                                active_tgame_key,
+                                                _v160_build_result_only_response(
+                                                    TGAME_ZN_RES_USE_CARD,
+                                                    use_result,
+                                                ),
+                                                label,
+                                                "ZN2C_RES_USECARD v160 "
+                                                f"cmd=0xA348 result=0x{use_result:04x}",
+                                            )
+                                            if use_prop is not None:
+                                                _v140_send_full_inventory(
+                                                    conn,
+                                                    active_tgame_key,
+                                                    label,
+                                                    prefix="v160-use-card",
+                                                    session_uin=_v150_role_uin(role_state),
+                                                )
+                                            log(
+                                                "MALL-ITEM",
+                                                "v160 A347 UseCard "
+                                                f"FunctionType={locals().get('func_type', -1)} "
+                                                f"SubFunctionType={locals().get('sub_func_type', -1)} "
+                                                f"result=0x{use_result:04x} => {use_action}",
+                                            )
+
+                                        elif app["cmd"] == TGAME_ZN_REQ_CLEAR_MATCH_RECORD:
+                                            card = _v160_consume_inventory_item(
+                                                V160_CLEAR_RECORD_CARD_ITEM_ID,
+                                                "F303-clear-match-record-card",
+                                            )
+                                            clear_result = (
+                                                ZONE_ERR_SUCC
+                                                if card is not None
+                                                else ZONE_FAIL_NOACCOUNTEXIST
+                                            )
+                                            _v48_send_app(
+                                                conn,
+                                                active_tgame_key,
+                                                _v160_build_result_only_response(
+                                                    TGAME_ZN_RES_CLEAR_MATCH_RECORD,
+                                                    clear_result,
+                                                ),
+                                                label,
+                                                "ZN2C_RES_CLEARMATCHRECORD v160 "
+                                                f"cmd=0xF304 result=0x{clear_result:04x}",
+                                            )
+                                            if card is not None:
+                                                _v140_send_full_inventory(
+                                                    conn,
+                                                    active_tgame_key,
+                                                    label,
+                                                    prefix="v160-clear-record-card",
+                                                    session_uin=_v150_role_uin(role_state),
+                                                )
+                                            log(
+                                                "MALL-ITEM",
+                                                "v160 F303 ClearMatchRecordData "
+                                                f"card_item={V160_CLEAR_RECORD_CARD_ITEM_ID} "
+                                                f"consumed={card is not None}",
+                                            )
+
+                                        elif app["cmd"] == TGAME_ZN_REQ_CLEAR_MATCH_WINLOSE:
+                                            card = _v160_consume_inventory_item(
+                                                V160_CLEAR_WINLOSE_CARD_ITEM_ID,
+                                                "F305-clear-winlose-card",
+                                            )
+                                            clear_result = (
+                                                ZONE_ERR_SUCC
+                                                if card is not None
+                                                else ZONE_FAIL_NOACCOUNTEXIST
+                                            )
+                                            _v48_send_app(
+                                                conn,
+                                                active_tgame_key,
+                                                _v160_build_result_only_response(
+                                                    TGAME_ZN_RES_CLEAR_MATCH_WINLOSE,
+                                                    clear_result,
+                                                ),
+                                                label,
+                                                "ZN2C_RES_CLEARMATCHWINLOSE v160 "
+                                                f"cmd=0xF306 result=0x{clear_result:04x}",
+                                            )
+                                            if card is not None:
+                                                _v140_send_full_inventory(
+                                                    conn,
+                                                    active_tgame_key,
+                                                    label,
+                                                    prefix="v160-clear-winlose-card",
+                                                    session_uin=_v150_role_uin(role_state),
+                                                )
+                                            log(
+                                                "MALL-ITEM",
+                                                "v160 F305 ClearMatchWinLoseData "
+                                                f"card_item={V160_CLEAR_WINLOSE_CARD_ITEM_ID} "
+                                                f"consumed={card is not None}",
+                                            )
 
                                         elif app["cmd"] == TGAME_ZN_REQ_CHANGE_NICKNAME:
                                             try:
@@ -12059,13 +14480,26 @@ def handle_placeholder(conn, addr, label):
                                                             f"{nick_ds_e}",
                                                         )
 
+                                                rename_card = _v160_consume_inventory_item(
+                                                    V160_RENAME_CARD_ITEM_ID,
+                                                    "F301-rename-card-consume",
+                                                )
+                                                if rename_card is not None:
+                                                    _v140_send_full_inventory(
+                                                        conn,
+                                                        active_tgame_key,
+                                                        label,
+                                                        prefix="v160-rename-card",
+                                                        session_uin=uin_now,
+                                                    )
+
                                                 log(
                                                     "NICKNAME",
                                                     "F301 handled with atomic nickname claim: "
                                                     f"uin={uin_now} old={old_nickname!r} "
                                                     f"new={new_nickname!r}; "
                                                     "runtime + SQLite identity committed; "
-                                                    "NO Rename Card consumption",
+                                                    f"Rename Card consumed={rename_card is not None}",
                                                 )
 
                                         else:
@@ -12090,14 +14524,14 @@ def handle_placeholder(conn, addr, label):
                                             "v95 DS DECRYPTED NONSTANDARD PAYLOAD: "
                                             f"{type(app_e).__name__}: {app_e}; "
                                             f"plain_len={len(plain_now)} "
-                                            f"plain={plain_now.hex()}"
+                                            f"plain={_clan_debug_hex(plain_now)}"
                                         )
                                     else:
                                         log(
                                             label,
                                             f"TGame application parse/dispatch FAILED: "
                                             f"{type(app_e).__name__}: {app_e}; "
-                                            f"plain={plain_now.hex()}"
+                                            f"plain={_clan_debug_hex(plain_now)}"
                                         )
                         except Exception as e:
                             log(
@@ -13174,7 +15608,14 @@ def listen_on_port(port, label, sock=None):
 # Startup
 # ---------------------------------------------------------------------------
 
-print("[BOOT] BUILD=v143b-GITHUB-MAIN-c7ad3-BAG-CATALOG-DYNAMIC-1-5-A006-RECONCILE-v156+SQLITE-EXP-A005 + STABLE LOGIN UIN + SQLITE PROFILE/WALLET/INVENTORY + F301/F302 (NO COMMIT)")
+print("[BOOT] BUILD=v143b-GITHUB-MAIN-c7ad3-BAG-CATALOG-DYNAMIC-1-5-A006-RECONCILE-v156+SQLITE-EXP-A005 + STABLE LOGIN UIN + SQLITE PROFILE/WALLET/INVENTORY + F301/F302 + RESTART-RESUME-HOSTED-MULTISESSION-v1 + A00A-UPDPROP-v100 + NO-AP-MEMSYNC")
+print(
+    f"[BOOT] Hosted reconnect persistence: sqlite-multisession=enabled "
+    f"session_ttl={SESSION_TTL_SECONDS}s "
+    f"touch_interval={TGAME_SESSION_TOUCH_INTERVAL_SECONDS:.0f}s "
+    f"binding=UIN+client-IP+encrypted-transport-key",
+    flush=True,
+)
 print(
     "[BOOT] First-login nickname v26g: VERIFIED same-session A003 -> "
     "defer A006 -> A146/A147 -> A005 -> A006; "
@@ -13211,8 +15652,7 @@ print(
     f"legacy_exists={V140_MALL_STATE_PATH.exists()}"
 )
 print(
-    "[BOOT] AP initialization: "
-    + ("disabled in server-only mode" if SERVER_ONLY_MODE else _V143V_LOCAL_AP_SYNC.describe())
+    "[BOOT] AP synchronization: native A50E -> A00A UpdatePlayerProperty"
 )
 print(
     f"[BOOT] Runtime mode: {RUNTIME_MODE}; "
@@ -13314,13 +15754,6 @@ if __name__ == "__main__":
     # Mutable DS runtime state is created only after preflight succeeds.
     _v143b_init_spawner()
 
-    # TEMPORARY local PH AP initializer. It writes into a local TGame process,
-    # so it is intentionally disabled when this machine is backend-only.
-    if SERVER_ONLY_MODE:
-        print("[SERVER-ONLY] Local TGame AP memory sync disabled.", flush=True)
-    else:
-        _V143V_LOCAL_AP_SYNC.start()
-
     print(
         f"[BOOT] VERSION response: "
         f"{len(VERSION_RESPONSE)}B",
@@ -13392,10 +15825,6 @@ if __name__ == "__main__":
             except Exception:
                 pass
         if not SERVER_ONLY_MODE:
-            try:
-                _V143V_LOCAL_AP_SYNC.stop()
-            except Exception:
-                pass
             update_launch_gate_status(ready=False, reason=reason)
         raise SystemExit(5)
     log(
@@ -13440,7 +15869,6 @@ if __name__ == "__main__":
                     flush=True,
                 )
         if not SERVER_ONLY_MODE:
-            _V143V_LOCAL_AP_SYNC.stop()
             update_launch_gate_status(
                 ready=False,
                 reason="server shutting down",

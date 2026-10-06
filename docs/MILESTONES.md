@@ -144,7 +144,8 @@ Tasks:
 - [ ] Improve error messages and startup diagnostics
 - [ ] Add contributor issue templates for protocol research
 - [ ] Document reproducible client compatibility requirements
-- [ ] Replace the **temporary local AP/GamePoint process-memory initializer** with the verified native PH login/TP-balance path, then remove the `LocalPlayerData.GamePoint + 0x84` workaround
+- [x] Recover and live-verify the native PH A50E TP/AP refresh path using the schema-sensitive A00A UpdatePlayerProperty notification
+- [x] Remove the obsolete local AP/GamePoint process-memory initializer; AP synchronization now uses the native protocol path only
 - [ ] Tag a stable release after regression testing
 
 **Exit condition:** the stable project can be installed, understood, tested, and extended from the public repository alone.

@@ -75,6 +75,8 @@ $env:AF_DS_MAX_INSTANCES = "4"
 
 The default local slot layout uses public bridge ports beginning at UDP 65008 and AFDEV target ports beginning at UDP 7777. Keep these development listeners on a trusted/local network.
 
+For hosted matches, per-packet decode/logging is disabled by default. It decrypts and reparses every datagram and flushes a diagnostic line to the bridge log, which adds avoidable processing jitter. To temporarily restore packet traces, set `AF_DS_PACKET_DIAGNOSTICS=1` before starting the emulator server, or pass `--packet-diagnostics` when running the bridge directly.
+
 ## Validation
 
 The repository includes `tests/test_pve_ds_lifecycle.py`, `tests/test_pve_difficulty.py`, and `tests/test_pve_map_selection.py` for stock-client map propagation invariants. Live Windows validation still depends on a lawfully supplied PH client and AFDEV executable.

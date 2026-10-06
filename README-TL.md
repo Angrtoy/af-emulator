@@ -21,7 +21,7 @@ Nasa [buong gabay sa English](README.md) ang lahat ng hakbang at eksaktong comma
 
 ## Status at paghingi ng tulong
 
-Ang kasalukuyang public stable baseline ay **v143b**. Gumagana ang VERSION, AUTH, DIR, ROLE at ZONE, pamamahala ng mga room, at PvE match flow. Ginagawa pa ang first-time nickname/account creation at ilang social/progression feature. Pansamantala pa ang local AP initialization sync sa client.
+Ang kasalukuyang public stable baseline ay **v143b**. Gumagana ang VERSION, AUTH, DIR, ROLE at ZONE, pamamahala ng mga room, at PvE match flow. Ginagawa pa ang first-time nickname/account creation at ilang social/progression feature. Ang AP synchronization ay gumagamit na ng native protocol path; wala nang local process-memory AP helper.
 
 Kapag humingi ng tulong, ipadala ang screenshot ng error, kung anong hakbang ang ginagawa mo, ang eksaktong command, `server/af_server_live.log`, at bersyon ng laro. **Huwag ipadala** ang `PRIVATE.PEM`, password, account credential, token, o orihinal na game file.
 

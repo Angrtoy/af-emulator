@@ -21,7 +21,7 @@ Consultez le [guide complet en anglais](README.md) pour les étapes et commandes
 
 ## État et aide
 
-La base stable publique actuelle est **v143b**. Les chemins VERSION, AUTH, DIR, ROLE et ZONE, la gestion des salles et le flux des parties PvE fonctionnent. La création initiale du pseudo/compte et certaines fonctions sociales et de progression sont encore en cours. La synchronisation initiale des AP côté client repose encore sur une solution locale temporaire.
+La base stable publique actuelle est **v143b**. Les chemins VERSION, AUTH, DIR, ROLE et ZONE, la gestion des salles et le flux des parties PvE fonctionnent. La création initiale du pseudo/compte et certaines fonctions sociales et de progression sont encore en cours. La synchronisation des AP utilise désormais uniquement le chemin protocolaire natif ; l'ancien helper local en mémoire du processus a été supprimé.
 
 Pour demander de l’aide, envoyez une capture de l’erreur, l’étape suivie, la commande exacte, `server/af_server_live.log` et la version du jeu. **N’envoyez pas** `PRIVATE.PEM`, de mots de passe, d’identifiants de compte, de jetons ni de fichiers originaux du jeu.
 

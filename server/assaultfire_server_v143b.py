@@ -11,6 +11,7 @@ from pathlib import Path
 import socket
 import copy
 import functools
+import heapq
 import threading
 import time
 import struct
@@ -3186,6 +3187,16 @@ def tgame_parse_generic_body(pkt):
     return cmd, head_len, body_len, pkt[head_len:head_len + body_len]
 
 
+# Upper bounds for one post-CHGSKEY TPDU.  A connection can never buffer more
+# than TGAME_MAX_FRAME_LEN bytes of partial frame, so these also bound the
+# per-connection receive tail.  Defaults match the previous inline limits.
+TGAME_MAX_HEAD_LEN = 0x10000
+TGAME_MAX_FRAME_LEN = max(
+    0x1000,
+    int(os.environ.get("AF_TGAME_MAX_FRAME_BYTES", "") or 0x400000),
+)
+
+
 def tgame_split_generic_stream(data):
     """Split a TCP byte stream into complete post-CHGSKEY TGame TPDU frames.
 
@@ -3207,13 +3218,13 @@ def tgame_split_generic_stream(data):
         head_len = struct.unpack(">I", data[off + 4:off + 8])[0]
         body_len = struct.unpack(">I", data[off + 8:off + 12])[0]
 
-        if head_len < 12 or head_len > 0x10000:
+        if head_len < 12 or head_len > TGAME_MAX_HEAD_LEN:
             raise ValueError(
                 f"invalid stream HeadLen={head_len} at +0x{off:x}"
             )
 
         frame_len = head_len + body_len
-        if frame_len < 12 or frame_len > 0x400000:
+        if frame_len < 12 or frame_len > TGAME_MAX_FRAME_LEN:
             raise ValueError(
                 f"invalid stream frame_len={frame_len} at +0x{off:x}"
             )
@@ -15445,6 +15456,60 @@ def _v97_build_welcome_payload(level_name=None, game_name=None, redirect_url=Non
     )
 
 
+def _env_positive_int(name, default):
+    try:
+        value = int(os.environ.get(name, "") or default)
+    except ValueError:
+        return int(default)
+    return value if value > 0 else int(default)
+
+
+# Per-source-address state for the DS UDP listener.  UDP source addresses can
+# be spoofed or scanned, so the table must not grow without bound.
+_UDP_PEER_TTL_SECONDS = _env_positive_int("AF_UDP_PEER_TTL_SECONDS", 600)
+_UDP_PEER_MAX_ENTRIES = _env_positive_int("AF_UDP_PEER_MAX_ENTRIES", 4096)
+_UDP_PEER_PRUNE_INTERVAL = 5.0
+
+
+def _prune_udp_peer_state(
+    peer_state,
+    now,
+    ttl=None,
+    max_entries=None,
+):
+    """Drop idle peers, then evict the least recently seen above the cap.
+
+    Returns the number of entries removed.  Entries are dicts carrying a
+    monotonic ``last_seen`` timestamp; entries without one count as expired.
+    """
+    ttl = _UDP_PEER_TTL_SECONDS if ttl is None else ttl
+    max_entries = _UDP_PEER_MAX_ENTRIES if max_entries is None else max_entries
+    removed = 0
+
+    for addr in [
+        a for a, st in peer_state.items()
+        if now - float(st.get("last_seen", float("-inf"))) > ttl
+    ]:
+        del peer_state[addr]
+        removed += 1
+
+    if len(peer_state) > max_entries:
+        # Evict down to a low-water mark (90% of the cap) so a flood of new
+        # addresses triggers one sort per ~10% of the cap, not one per packet.
+        target = max_entries - max_entries // 10
+        excess = len(peer_state) - target
+        oldest = heapq.nsmallest(
+            excess,
+            peer_state,
+            key=lambda a: peer_state[a].get("last_seen", 0.0),
+        )
+        for addr in oldest:
+            del peer_state[addr]
+            removed += 1
+
+    return removed
+
+
 def listen_on_udp_port(port, label="DS-UDP", sock=None):
     """v98: accept AF's coalesced Netspeed+Login and send NMT_Welcome.
 
@@ -15469,10 +15534,25 @@ def listen_on_udp_port(port, label="DS-UDP", sock=None):
     )
 
     peer_state = {}
+    last_prune = time.monotonic()
 
     while True:
         try:
             data, addr = s.recvfrom(65535)
+
+            recv_now = time.monotonic()
+            if (
+                recv_now - last_prune >= _UDP_PEER_PRUNE_INTERVAL
+                or len(peer_state) > _UDP_PEER_MAX_ENTRIES
+            ):
+                removed = _prune_udp_peer_state(peer_state, recv_now)
+                last_prune = recv_now
+                if removed:
+                    log(
+                        label,
+                        f"pruned {removed} idle/excess UDP peer(s); "
+                        f"{len(peer_state)} tracked"
+                    )
 
             st = peer_state.setdefault(addr, {
                 "rx_count": 0,
@@ -15487,6 +15567,7 @@ def listen_on_udp_port(port, label="DS-UDP", sock=None):
                 "last_keepalive": 0.0,
             })
             st["rx_count"] += 1
+            st["last_seen"] = recv_now
             n = st["rx_count"]
 
             try:
@@ -15499,6 +15580,10 @@ def listen_on_udp_port(port, label="DS-UDP", sock=None):
                     f"{type(e).__name__}: {e}; "
                     f"wire={data.hex()}"
                 )
+                if n == 1:
+                    # Never keep state for an address whose first datagram
+                    # is undecodable (scans, spoofed junk).
+                    peer_state.pop(addr, None)
                 continue
 
             bunches = [

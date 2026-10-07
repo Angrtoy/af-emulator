@@ -1,24 +1,48 @@
 from pathlib import Path
 import ast
+import heapq
+import os
 import struct
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVER_PATH = ROOT / "server" / "assaultfire_server_v143b.py"
 
 
-def load_server_function(name):
-    """Load one pure helper from the server without importing boot-time state."""
+def load_server_symbols(function_names, constant_names=()):
+    """Load pure helpers and module-level constants without boot-time state."""
     source = SERVER_PATH.read_text(encoding="utf-8", errors="replace")
     tree = ast.parse(source)
+    wanted_funcs = set(function_names)
+    wanted_consts = set(constant_names)
+    body = []
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
-            module = ast.Module(body=[node], type_ignores=[])
-            ast.fix_missing_locations(module)
-            ns = {"struct": struct}
-            exec(compile(module, str(SERVER_PATH), "exec"), ns)
-            return ns[name]
-    raise AssertionError(f"server function not found: {name}")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in wanted_funcs:
+            body.append(node)
+            wanted_funcs.discard(node.name)
+        elif isinstance(node, ast.Assign) and any(
+            isinstance(t, ast.Name) and t.id in wanted_consts for t in node.targets
+        ):
+            body.append(node)
+            wanted_consts -= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    missing = wanted_funcs | wanted_consts
+    if missing:
+        raise AssertionError(f"server symbols not found: {sorted(missing)}")
+    module = ast.Module(body=body, type_ignores=[])
+    ast.fix_missing_locations(module)
+    ns = {"struct": struct, "os": os, "time": time, "heapq": heapq}
+    exec(compile(module, str(SERVER_PATH), "exec"), ns)
+    return ns
+
+
+def load_server_function(name):
+    """Load one pure helper (plus the frame-limit constants) from the server."""
+    ns = load_server_symbols(
+        [name],
+        ["TGAME_MAX_HEAD_LEN", "TGAME_MAX_FRAME_LEN"],
+    )
+    return ns[name]
 
 
 split_stream = load_server_function("tgame_split_generic_stream")
@@ -94,6 +118,96 @@ class TGameTCPStreamTests(unittest.TestCase):
         self.assertIn("tgame_chgskey_complete = True", source)
         self.assertNotIn("post_chgskey_stream_mode = False", source)
         self.assertNotIn("post_chgskey_frame_queue.clear()", source)
+
+
+    def test_oversized_frame_is_rejected_so_tail_stays_bounded(self):
+        ns = load_server_symbols(
+            ["tgame_split_generic_stream"],
+            ["TGAME_MAX_HEAD_LEN", "TGAME_MAX_FRAME_LEN"],
+        )
+        limit = ns["TGAME_MAX_FRAME_LEN"]
+        header = (
+            b"\x55\x0e\x00\x04"
+            + struct.pack(">I", 12)
+            + struct.pack(">I", limit)  # head 12 + body limit > limit
+        )
+        with self.assertRaises(ValueError):
+            ns["tgame_split_generic_stream"](header)
+
+    def test_frame_at_limit_is_buffered_not_rejected(self):
+        ns = load_server_symbols(
+            ["tgame_split_generic_stream"],
+            ["TGAME_MAX_HEAD_LEN", "TGAME_MAX_FRAME_LEN"],
+        )
+        limit = ns["TGAME_MAX_FRAME_LEN"]
+        header = (
+            b"\x55\x0e\x00\x04"
+            + struct.pack(">I", 12)
+            + struct.pack(">I", limit - 12)
+        )
+        frames, tail = ns["tgame_split_generic_stream"](header)
+        self.assertEqual(frames, [])
+        self.assertEqual(tail, header)
+
+    def test_oversized_head_len_is_rejected(self):
+        ns = load_server_symbols(
+            ["tgame_split_generic_stream"],
+            ["TGAME_MAX_HEAD_LEN", "TGAME_MAX_FRAME_LEN"],
+        )
+        header = (
+            b"\x55\x0e\x00\x04"
+            + struct.pack(">I", ns["TGAME_MAX_HEAD_LEN"] + 1)
+            + struct.pack(">I", 0)
+        )
+        with self.assertRaises(ValueError):
+            ns["tgame_split_generic_stream"](header)
+
+
+class UDPPeerStatePruneTests(unittest.TestCase):
+    def setUp(self):
+        self.ns = load_server_symbols(
+            ["_env_positive_int", "_prune_udp_peer_state"],
+            ["_UDP_PEER_TTL_SECONDS", "_UDP_PEER_MAX_ENTRIES"],
+        )
+        self.prune = self.ns["_prune_udp_peer_state"]
+
+    def test_idle_peers_expire_and_active_peers_stay(self):
+        peers = {
+            ("1.1.1.1", 1): {"last_seen": 100.0},
+            ("2.2.2.2", 2): {"last_seen": 990.0},
+        }
+        removed = self.prune(peers, now=1000.0, ttl=600, max_entries=10)
+        self.assertEqual(removed, 1)
+        self.assertEqual(list(peers), [("2.2.2.2", 2)])
+
+    def test_entry_without_last_seen_counts_as_expired(self):
+        peers = {("3.3.3.3", 3): {}}
+        self.assertEqual(self.prune(peers, now=1.0, ttl=600, max_entries=10), 1)
+        self.assertEqual(peers, {})
+
+    def test_cap_evicts_least_recently_seen_first(self):
+        peers = {("h", i): {"last_seen": 1000.0 + i} for i in range(10)}
+        removed = self.prune(peers, now=1010.0, ttl=600, max_entries=4)
+        self.assertEqual(removed, 6)
+        self.assertEqual(sorted(a[1] for a in peers), [6, 7, 8, 9])
+
+    def test_flood_stays_under_cap_with_amortized_pruning(self):
+        peers = {}
+        prunes = 0
+        for i in range(50_000):
+            peers[("10.0.%d.%d" % (i // 250, i % 250), i)] = {"last_seen": float(i)}
+            if len(peers) > 4096:
+                self.prune(peers, now=float(i), ttl=10**9, max_entries=4096)
+                prunes += 1
+        self.assertLessEqual(len(peers), 4096)
+        # Low-water eviction: roughly one prune per ~410 new peers, not one per packet.
+        self.assertLess(prunes, 200)
+
+    def test_server_prunes_and_drops_undecodable_first_packet(self):
+        source = SERVER_PATH.read_text(encoding="utf-8", errors="replace")
+        self.assertIn("_prune_udp_peer_state(peer_state, recv_now)", source)
+        self.assertIn('st["last_seen"] = recv_now', source)
+        self.assertIn("peer_state.pop(addr, None)", source)
 
 
 if __name__ == "__main__":

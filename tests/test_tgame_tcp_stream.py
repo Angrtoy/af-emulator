@@ -210,5 +210,57 @@ class UDPPeerStatePruneTests(unittest.TestCase):
         self.assertIn("peer_state.pop(addr, None)", source)
 
 
+class ConnectionLifetimeCapTests(unittest.TestCase):
+    def setUp(self):
+        self.ns = load_server_symbols(
+            ["_env_positive_int", "_followup_deadline"],
+            ["_CONN_MAX_LIFETIME_SECONDS"],
+        )
+        self.deadline = self.ns["_followup_deadline"]
+
+    def test_idle_timeout_applies_when_below_the_cap(self):
+        self.assertEqual(self.deadline(1000.0, 1000.0, 3600.0, 43200), 4600.0)
+
+    def test_activity_can_never_push_the_deadline_past_the_cap(self):
+        started = 1000.0
+        cap_end = started + 43200
+        # A client that keeps sending for 11h59m still dies at the cap.
+        now = started + 43200 - 60
+        self.assertEqual(self.deadline(now, started, 3600.0, 43200), cap_end)
+        # And no later activity can move it further out.
+        self.assertEqual(
+            self.deadline(started + 43200 + 500, started, 3600.0, 43200), cap_end
+        )
+
+    def test_default_cap_is_twelve_hours_and_env_overridable(self):
+        self.assertEqual(self.ns["_CONN_MAX_LIFETIME_SECONDS"], 12 * 3600)
+        env = self.ns["_env_positive_int"]
+        old = os.environ.get("AF_CONN_MAX_LIFETIME_SECONDS")
+        try:
+            os.environ["AF_CONN_MAX_LIFETIME_SECONDS"] = "7200"
+            self.assertEqual(env("AF_CONN_MAX_LIFETIME_SECONDS", 1), 7200)
+            os.environ["AF_CONN_MAX_LIFETIME_SECONDS"] = "junk"
+            self.assertEqual(env("AF_CONN_MAX_LIFETIME_SECONDS", 99), 99)
+            os.environ["AF_CONN_MAX_LIFETIME_SECONDS"] = "0"
+            self.assertEqual(env("AF_CONN_MAX_LIFETIME_SECONDS", 99), 99)
+        finally:
+            if old is None:
+                os.environ.pop("AF_CONN_MAX_LIFETIME_SECONDS", None)
+            else:
+                os.environ["AF_CONN_MAX_LIFETIME_SECONDS"] = old
+
+    def test_framed_streams_reset_idle_timer_only_on_complete_frames(self):
+        source = SERVER_PATH.read_text(encoding="utf-8", errors="replace")
+        # Byte-level reset is limited to the not-yet-framed case...
+        self.assertIn(
+            "rx_chunk\n                    and not tgame_stream_mode",
+            source,
+        )
+        # ...and the framed case resets after complete frames are produced.
+        idx_empty = source.index("                        if not frames:\n                            continue")
+        idx_reset = source.index("_followup_deadline(", idx_empty)
+        self.assertLess(idx_reset - idx_empty, 400)
+
+
 if __name__ == "__main__":
     unittest.main()

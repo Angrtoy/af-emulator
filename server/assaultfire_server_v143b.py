@@ -10066,8 +10066,15 @@ def handle_placeholder(conn, addr, label):
         )
 
         followup_seconds = 3600.0 if label.upper() in ("ZONE", "DS-TCP") else 120.0
-        deadline = time.time() + followup_seconds
-        log(label, f"Follow-up receive lifetime={followup_seconds:.0f}s")
+        conn_started = time.time()
+        deadline = _followup_deadline(
+            conn_started, conn_started, followup_seconds, _CONN_MAX_LIFETIME_SECONDS
+        )
+        log(
+            label,
+            f"Follow-up receive lifetime={followup_seconds:.0f}s "
+            f"(hard cap {_CONN_MAX_LIFETIME_SECONDS}s)"
+        )
         conn.settimeout(1.0)
 
         # Transport crypto state changes immediately after a successful cmd01.
@@ -10111,11 +10118,23 @@ def handle_placeholder(conn, addr, label):
                 except socket.timeout:
                     continue
 
-                if rx_chunk and label.upper() in ("ZONE", "DS-TCP"):
+                if (
+                    rx_chunk
+                    and not tgame_stream_mode
+                    and label.upper() in ("ZONE", "DS-TCP")
+                ):
                     # Treat the lifetime as an IDLE timeout for long-lived
                     # sessions: activity extends it instead of cutting an
-                    # active player off at a fixed wall-clock hour.
-                    deadline = time.time() + followup_seconds
+                    # active player off at a fixed wall-clock hour.  Once the
+                    # stream is framed, only a COMPLETE frame counts as
+                    # activity (see below), so dripping single bytes cannot
+                    # hold the connection slot open.  Either way the hard
+                    # lifetime cap bounds the total connection time.
+                    now_rx = time.time()
+                    deadline = _followup_deadline(
+                        now_rx, conn_started, followup_seconds,
+                        _CONN_MAX_LIFETIME_SECONDS,
+                    )
 
                 if not rx_chunk:
                     log(label, "Client closed connection; if this was client.exe after TACC-RSP, that can be normal. Watch for next VERSION/ROLE owner=TGame.exe.")
@@ -10146,6 +10165,12 @@ def handle_placeholder(conn, addr, label):
                         )
                         if not frames:
                             continue
+                        if label.upper() in ("ZONE", "DS-TCP"):
+                            now_rx = time.time()
+                            deadline = _followup_deadline(
+                                now_rx, conn_started, followup_seconds,
+                                _CONN_MAX_LIFETIME_SECONDS,
+                            )
                         extra = frames.pop(0)
                         tgame_stream_frame_queue.extend(frames)
                         log(
@@ -15469,6 +15494,19 @@ def _env_positive_int(name, default):
 _UDP_PEER_TTL_SECONDS = _env_positive_int("AF_UDP_PEER_TTL_SECONDS", 600)
 _UDP_PEER_MAX_ENTRIES = _env_positive_int("AF_UDP_PEER_MAX_ENTRIES", 4096)
 _UDP_PEER_PRUNE_INTERVAL = 5.0
+
+# Hard ceiling on one ZONE/DS-TCP follow-up connection, regardless of activity.
+# The idle timer alone can be extended forever by a client that keeps sending,
+# which lets it hold one of the per-port connection slots indefinitely.
+# Default 12 hours; override with AF_CONN_MAX_LIFETIME_SECONDS.
+_CONN_MAX_LIFETIME_SECONDS = _env_positive_int(
+    "AF_CONN_MAX_LIFETIME_SECONDS", 12 * 3600
+)
+
+
+def _followup_deadline(now, started, idle_seconds, max_lifetime):
+    """Next follow-up deadline: idle timeout, never past the hard lifetime cap."""
+    return min(now + idle_seconds, started + max_lifetime)
 
 
 def _prune_udp_peer_state(

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import os
 import re
 import sqlite3
@@ -46,6 +47,10 @@ class DuplicateUsername(AccountError):
     pass
 
 
+class InvalidRegistrationIP(AccountError):
+    pass
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -70,6 +75,26 @@ def validate_password(password: str) -> None:
         raise InvalidPassword(
             f"Password must be at most {PASSWORD_MAX_LENGTH} characters."
         )
+
+
+def normalize_registration_ip(value: Any) -> str | None:
+    """Return the canonical text form of an IPv4/IPv6 address, or None.
+
+    ``None`` and blank strings mean "not provided". Anything else must be a
+    single valid IP address; a proxy header list such as "1.2.3.4, 5.6.7.8"
+    must be reduced to the client address by the caller.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError as exc:
+        raise InvalidRegistrationIP(
+            "registration_ip must be a single valid IPv4 or IPv6 address."
+        ) from exc
 
 
 def _hash_password(
@@ -162,6 +187,7 @@ def init_db(db_path: str | os.PathLike[str] | None = None) -> Path:
             ("ap_token_hash", "BLOB"),
             ("ap_token_salt", "BLOB"),
             ("ap_token_iterations", "INTEGER"),
+            ("registration_ip", "TEXT"),
         ):
             if column not in account_columns:
                 conn.execute(f"ALTER TABLE accounts ADD COLUMN {column} {sql_type}")
@@ -223,9 +249,11 @@ def create_account(
     password: str,
     *,
     db_path: str | os.PathLike[str] | None = None,
+    registration_ip: str | None = None,
 ) -> dict[str, Any]:
     username = (username or "").strip()
     username_norm = normalize_username(username)
+    registration_ip = normalize_registration_ip(registration_ip)
     digest, salt, iterations = _hash_password(
         password,
         iterations=PBKDF2_ITERATIONS,
@@ -256,9 +284,9 @@ def create_account(
                 uin, username, username_norm,
                 password_hash, password_salt, password_iterations,
                 ap_token_hash, ap_token_salt, ap_token_iterations,
-                status, created_at
+                status, created_at, registration_ip
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
             """,
             (
                 uin,
@@ -271,6 +299,7 @@ def create_account(
                 ap_salt,
                 ap_iterations,
                 created_at,
+                registration_ip,
             ),
         )
         conn.execute(
@@ -283,6 +312,7 @@ def create_account(
             "username": username,
             "status": "active",
             "created_at": created_at,
+            "registration_ip": registration_ip,
         }
     except DuplicateUsername:
         conn.rollback()
